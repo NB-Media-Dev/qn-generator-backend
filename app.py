@@ -114,7 +114,15 @@ _notes_text_cache: dict[str, str] = {}
 _notes_text_cache_lock = threading.Lock()
 CHUNK_THRESHOLD = 30
 CHUNK_SIZE = 25
-GEMINI_MAX_CONCURRENCY = int(os.getenv('GEMINI_MAX_CONCURRENCY', '5'))
+# Raised from 5 -> 10: lets more chunk/verify/proofread calls run in parallel
+# per request, which is the main lever for cutting wall-clock time on large
+# (e.g. 150-question) generations. Override with GEMINI_MAX_CONCURRENCY in
+# .env if your Gemini API key's rate limit can't sustain this.
+GEMINI_MAX_CONCURRENCY = int(os.getenv('GEMINI_MAX_CONCURRENCY', '10'))
+# Questions per generation chunk. Raised from 15 -> 20 so fewer round trips
+# are needed for the same total count (e.g. 180 questions = 9 chunks instead
+# of 12), without changing prompt content, formats, or validation logic.
+GENERATION_CHUNK_SIZE = int(os.getenv('GENERATION_CHUNK_SIZE', '20'))
 _MAX_RATE_LIMIT_RETRIES = 5
 _RATE_LIMIT_BACKOFF_SECONDS = 5
 _RETRY_DELAY_RE = re.compile('retryDelay[\'\\"]?\\s*:\\s*[\'\\"]?(\\d+)')
@@ -399,9 +407,25 @@ Respond with ONLY valid JSON, no extra commentary, no markdown fences, in exactl
 }}'''
     return prompt
 
+_gemini_client_cache: dict[str, "genai.Client"] = {}
+_gemini_client_cache_lock = threading.Lock()
+
+def _get_gemini_client(api_key: str):
+    # Reuse one client per API key instead of constructing a new one on every
+    # single chunk/verify/proofread call. Safe, purely additive change - the
+    # underlying request behavior (model, prompt, config) is unchanged.
+    client = _gemini_client_cache.get(api_key)
+    if client is None:
+        with _gemini_client_cache_lock:
+            client = _gemini_client_cache.get(api_key)
+            if client is None:
+                client = genai.Client(api_key=api_key)
+                _gemini_client_cache[api_key] = client
+    return client
+
 def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thinking_budget: int=0, _is_retry: bool=False, _rate_limit_attempt: int=0):
     from google.genai import errors, types
-    client = genai.Client(api_key=api_key)
+    client = _get_gemini_client(api_key)
     try:
         if thinking_budget > 0:
             config = types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget), response_mime_type='application/json')
@@ -462,7 +486,7 @@ async def _proofread_batch_limited(semaphore: asyncio.Semaphore, batch: list[dic
 async def proofread_questions(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     if not questions: return questions
     batch_size = 15
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENCY)
     tasks = []
     for i in range(0, len(questions), batch_size):
         batch = questions[i:i + batch_size]
@@ -569,7 +593,7 @@ async def _verify_batch_limited(semaphore: asyncio.Semaphore, batch: list[dict],
 async def verify_and_correct_answers(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     if not questions: return questions
     batch_size = 15
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENCY)
     tasks = []
     for i in range(0, len(questions), batch_size):
         batch = questions[i:i + batch_size]
@@ -787,7 +811,7 @@ _INITIAL_OVERASK_FACTOR = 1.2
 
 async def generate_questions_data(notes_text: str, count: int, difficulty: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, language: str=None) -> dict:
     initial_ask = max(count, round(count * _INITIAL_OVERASK_FACTOR))
-    chunk_size = 15
+    chunk_size = GENERATION_CHUNK_SIZE
     chunk_threshold = chunk_size + 2
     chunk_sizes = _split_count(initial_ask, chunk_size) if initial_ask > chunk_threshold else [initial_ask]
     if language is None:
@@ -829,7 +853,7 @@ async def generate_questions_data(notes_text: str, count: int, difficulty: str, 
     return {'questions': delivered, 'requested_count': count, 'delivered_count': len(delivered)}
 
 _ANSWER_LETTER_TO_NUM = {'A': '1', 'B': '2', 'C': '3', 'D': '4'}
-SUBJECT_QUES_PREFIX_MAP = {'Tamil': 'TA', 'English': 'EN', 'Maths': 'MA', 'Science': 'SC', 'Social Science': 'SO', 'Physics': 'PH', 'Chemistry': 'CH', 'Biology': 'BI', 'Computer Science': 'CS', 'Botany': 'BO', 'Zoology': 'ZO', 'Commerce': 'CO', 'Economics': 'EC', 'Accountancy': 'AC', 'Business Mathematics': 'BM', 'Mathematics': 'MA'}
+SUBJECT_QUES_PREFIX_MAP = {'Tamil': 'TA', 'English': 'EN', 'Maths': 'MA', 'Science': 'SC', 'Social Science': 'SO', 'Physics': 'PH', 'Chemistry': 'CH', 'Biology': 'BI', 'Computer Science': 'CS', 'Botany': 'BO', 'Zoology': 'ZO', 'Commerce': 'CO', 'Economics': 'EC', 'Accountancy': 'AC', 'Computer Application': 'CA', 'Mathematics': 'MA'}
 
 def _build_dy_rows(questions: list[dict], subject: str, standard: str, dy_code: str, ques_id_prefix: str) -> list[dict]:
     # dy_code and ques_id_prefix are two separate, independently-typed fields:

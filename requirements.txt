@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+google-genai
+pymupdf
+pytesseract
+pillow
+python-docx
+python-pptx
+sqlalchemy
+httpx

@@ -1,0 +1,19 @@
+# Never commit real API keys
+credentials.txt
+.env
+
+# Local Python environment
+venv/
+__pycache__/
+*.pyc
+
+# Local database - Render gets a fresh one; don't ship your local history
+questions.db
+questions.db-shm
+questions.db-wal
+
+# Local generated output files
+generated_questions*.txt
+questions_easy_*.txt
+questions_moderate_*.txt
+questions_hard_*.txt

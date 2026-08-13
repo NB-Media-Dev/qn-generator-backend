@@ -11,10 +11,6 @@ from database import SessionLocal, QuestionRecord, LivePushLog
 
 EXTERNAL_DB_API_URL = os.getenv('EXTERNAL_DB_API_URL') or os.getenv('LIVE_DB_API_URL', '')
 EXTERNAL_API_KEY = os.getenv('EXTERNAL_API_KEY') or os.getenv('LIVE_DB_API_TOKEN', '')
-
-# Set LIVE_PUSH_DEBUG=1 in your .env to print the full raw response for every
-# push. Turn this on for your next push so you can see exactly what the live
-# API is sending back — that tells us definitively what's going wrong.
 LIVE_PUSH_DEBUG = os.getenv('LIVE_PUSH_DEBUG', '0') == '1'
 
 EXAM_TYPE_MAP = {
@@ -23,17 +19,13 @@ EXAM_TYPE_MAP = {
     'online': 'online',
 }
 
-MAX_CONCURRENCY = 1  # Sequential push: Live DB rejects out-of-order questions. Set to 1 for strict order, increase only if Live DB supports concurrent pushes
+MAX_CONCURRENCY = 1  
 
 LETTER_TO_INT = {
     'A': 1, 'B': 2, 'C': 3, 'D': 4,
     '1': 1, '2': 2, '3': 3, '4': 4
 }
 
-# Keys we look for inside a JSON response body to decide whether the live DB
-# actually accepted the row, on top of the HTTP status code. Confirmed shape
-# for this API (from live response_detail): {"Status": false, "Message": "..."}
-# Matching is case-insensitive since the API uses PascalCase ("Status").
 _SUCCESS_KEYS = ('success', 'ok', 'issuccess', 'inserted', 'status')
 _FAILURE_KEYS = ('error', 'errors', 'errormessage', 'message')
 _SUCCESS_STATUS_VALUES = {'success', 'ok', 'created', 'inserted', 'true', '1'}
@@ -45,25 +37,14 @@ def _utc_now_naive():
 
 
 def _response_indicates_success(http_ok: bool, detail) -> tuple[bool, str]:
-    """
-    Decide whether a push actually succeeded, using both the HTTP status and
-    the JSON body. Returns (ok, reason) so callers can log *why* something
-    was flagged as failed.
-
-    Confirmed live API shape: {"Status": false, "Message": "Seconds is not
-    numeric"} on rejection — keys are matched case-insensitively so "Status"
-    and "status" both work.
-    """
     if not http_ok:
         return False, 'non-2xx HTTP status'
 
     if not isinstance(detail, dict):
         return True, 'no JSON body to verify; trusted HTTP status only'
 
-    # Case-insensitive lookup map (API uses "Status"/"Message", PascalCase).
     lower_map = {str(k).lower(): v for k, v in detail.items()}
 
-    # Explicit boolean-style success/failure flags win first (covers "Status").
     for key in _SUCCESS_KEYS:
         if key in lower_map:
             val = lower_map[key]
@@ -76,27 +57,18 @@ def _response_indicates_success(http_ok: bool, detail) -> tuple[bool, str]:
                 if v in _FAILURE_STATUS_VALUES:
                     return False, f'body.{key}={v!r}'
 
-    # A message/error field with content usually means failure even under HTTP 200.
     for key in _FAILURE_KEYS:
         if key in lower_map and lower_map[key]:
             return False, f'body.{key}={lower_map[key]!r}'
 
-    # Nothing recognizable in the body — trust HTTP status but flag it.
     return True, 'body present but no recognizable success/error field; trusted HTTP status only'
 
 
 _NUMERIC_RE = re.compile(r'-?\d+(?:\.\d+)?')
-DEFAULT_QS_SECONDS = 60  # fallback used only when dy_seconds has no number in it at all
+DEFAULT_QS_SECONDS = 60  
 
 
 def _to_numeric_seconds(raw, dy_ques_id: str = '') -> int:
-    """
-    The live API rejects the whole row with {"Status": false, "Message":
-    "Seconds is not numeric"} if qsSeconds isn't a clean number. dy_seconds
-    is stored as a String column, so it can end up as "" / None / "45 sec" /
-    etc. Extract the number if there is one; otherwise fall back to a default
-    and print a warning so the bad source data doesn't get lost silently.
-    """
     if raw is not None:
         match = _NUMERIC_RE.search(str(raw))
         if match:
@@ -131,11 +103,6 @@ def row_to_live_payload(record: QuestionRecord, exam_type: str, exam_code: Optio
 
 
 def _payload_missing_fields(payload: dict) -> list:
-    """
-    Required-looking fields that, if None/empty, are a common reason an API
-    returns 200 but silently drops the row. Catching this BEFORE sending
-    means you find out immediately instead of after checking the live DB.
-    """
     required = ['examType', 'examCode', 'quesId', 'qsQuestion', 'option1', 'option2', 'option3', 'option4', 'crtAns']
     missing = [key for key in required if payload.get(key) in (None, '')]
     return missing
@@ -168,8 +135,6 @@ async def post_question_to_live_db(client: httpx.AsyncClient, payload: dict):
             )
 
         if not ok:
-            # Make the failure reason visible in the stored detail, so a
-            # glance at LivePushLog.response_detail explains itself.
             detail = {'_verdict': 'rejected', '_reason': reason, 'raw_response': detail}
 
         return ok, detail
@@ -248,12 +213,10 @@ async def push_records_to_live_db(
         raise RuntimeError('EXTERNAL_DB_API_URL / EXTERNAL_API_KEY are not configured on the server (.env).')
 
     records = list(records)
-    # Sort by dy_order to ensure questions are pushed in correct sequence (141, 142, 143...)
-    # This prevents Live DB from rejecting out-of-order questions
     try:
         records = sorted(records, key=lambda r: int(r.dy_order) if r.dy_order and str(r.dy_order).isdigit() else 0)
     except Exception:
-        pass  # If sorting fails, continue with original order
+        pass  
     
     all_ids = [r.dy_ques_id for r in records]
     already_pushed = set() if force else get_already_pushed(all_ids, exam_type)
@@ -267,9 +230,6 @@ async def push_records_to_live_db(
 
             missing = _payload_missing_fields(payload)
             if missing:
-                # Don't even send it — this is very likely why rows "succeed"
-                # (HTTP 200) but never show up: a required field is null and
-                # the live API accepts-but-drops the row.
                 print(f"[live-push] SKIPPING quesId={payload.get('quesId')!r}: missing fields {missing}")
                 return {
                     'record': record,

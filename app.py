@@ -834,20 +834,9 @@ _ANSWER_LETTER_TO_NUM = {'A': '1', 'B': '2', 'C': '3', 'D': '4'}
 SUBJECT_QUES_PREFIX_MAP = {'Tamil': 'TA', 'English': 'EN', 'Maths': 'MA', 'Science': 'SC', 'Social Science': 'SO', 'Physics': 'PH', 'Chemistry': 'CH', 'Biology': 'BI', 'Computer Science': 'CS', 'Botany': 'BO', 'Zoology': 'ZO', 'Commerce': 'CO', 'Economics': 'EC', 'Accountancy': 'AC', 'Business Mathematics': 'BM', 'Mathematics': 'MA'}
 
 def _build_dy_rows(questions: list[dict], subject: str, standard: str, dy_code: str, ques_id_prefix: str) -> list[dict]:
-    # dy_code and ques_id_prefix are two separate, independently-typed fields:
-    #   - dy_code       -> the exam code, saved as-is (used for the order/serial
-    #                       counter below, and as the exam identifier elsewhere).
-    #   - ques_id_prefix -> the literal prefix used to build dy_ques_id, e.g.
-    #                       typing "AI8EN2" here makes IDs AI8EN2001, AI8EN2002...
-    # They used to be silently merged into one auto-computed value (standard +
-    # subject only), which ignored whatever the user actually typed and caused
-    # different exams/weeks to generate colliding dy_ques_id values. Now both
-    # are taken exactly as typed.
     dy_code = (dy_code or '').strip().upper()
     id_prefix = (ques_id_prefix or '').strip().upper()
     rows = []
-
-    # Get sequential order numbers for this dy_code (1, 2, 3...)
     order_numbers = get_next_order_numbers_batch(dy_code, len(questions))
 
     for q, order_number in zip(questions, order_numbers):

@@ -182,12 +182,6 @@ def get_next_ques_numbers_batch(prefix: str, count: int, db=None) -> list[int]:
                 db.close()
 
 def get_next_order_numbers_batch(dy_code: str, count: int, db=None) -> list[int]:
-    """
-    Hand out `count` sequential dy_order values (1,2,3,4...) for one exam
-    (dy_code). Automatically checks the highest existing dy_order in the database
-    so that deleting questions allows numbering to start from 001 or seamlessly
-    continue from the last existing question.
-    """
     with _counter_lock:
         local_session = False
         if db is None:

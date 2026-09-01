@@ -299,7 +299,55 @@ def fix_answer_consistency(data: dict):
                     break
     return data
 
-def build_prompt(notes_text: str, count: int, difficulty: str, language: str, formats_list: list[int], avoid_questions: list[str] | None=None):
+_MATH_SUBJECTS = {'maths', 'mathematics', 'business mathematics'}
+_ACCOUNTS_SUBJECTS = {'accountancy', 'accounts', 'commerce'}
+
+# Formats 3 (Match the Following) and 8 (Assertion and Reason) are structurally
+# different from a plain direct question - too different to fit a numeric/theory
+# split, so they're dropped entirely for Maths/Accountancy. For every other
+# subject they're kept, but capped at a small fixed count PER GENERATION SET
+# (the whole requested count - e.g. 100, 150, 200 - not per chunk) rather than
+# scaling up with the total, since a set full of Match/Assertion-Reason questions
+# reads as repetitive at high volumes.
+_MATH_ACCOUNTS_EXCLUDED_FORMATS = {3, 8}
+_FORMAT_CAP_PER_SET = {3: 6, 8: 6}
+
+def new_format_state(subject: str | None) -> dict:
+    """Creates the shared, mutable format-rotation state for ONE generation job
+    (one call to /generate-questions). Pass the SAME dict into every
+    _assign_question_formats() call for that job - the initial batch, its
+    internal backfill, and the job-level _run_backfill - so the caps above are
+    enforced once across the whole requested count, not reset per chunk/call."""
+    subject_norm = (subject or '').strip().lower()
+    is_math_or_accounts = subject_norm in _MATH_SUBJECTS or subject_norm in _ACCOUNTS_SUBJECTS
+    if is_math_or_accounts:
+        available = [f for f in range(1, 15) if f not in _MATH_ACCOUNTS_EXCLUDED_FORMATS]
+        return {'next_idx': 0, 'available': available, 'caps': {}}
+    return {'next_idx': 0, 'available': list(range(1, 15)), 'caps': dict(_FORMAT_CAP_PER_SET)}
+
+def _assign_question_formats(count: int, state: dict) -> list[int]:
+    """Pulls `count` format numbers from the shared rotation `state`, skipping
+    any format whose per-set cap (state['caps']) has already been used up."""
+    available = state['available']
+    caps = state['caps']
+    formats = []
+    for _ in range(count):
+        attempts = 0
+        while True:
+            fmt = available[state['next_idx'] % len(available)]
+            state['next_idx'] += 1
+            attempts += 1
+            if fmt in caps:
+                if caps[fmt] <= 0:
+                    if attempts >= len(available):
+                        break  # every format capped/exhausted - use it anyway rather than stall
+                    continue
+                caps[fmt] -= 1
+            break
+        formats.append(fmt)
+    return formats
+
+def build_prompt(notes_text: str, count: int, difficulty: str, language: str, formats_list: list[int], avoid_questions: list[str] | None=None, subject: str | None=None):
     difficulty_guides = {
         'easy': "Direct factual recall. One correct fact, no reasoning needed. (Matches TNPSC Group 4 / TNTET difficulty.)",
         'moderate': "Requires connecting two related facts from the notes, or a 'which of the following is/is not correct' style statement question. (Matches TNPSC Group 2 difficulty.)",
@@ -337,6 +385,46 @@ IMPORTANT - QUESTION FORMAT DIVERSITY RULES:
 You must distribute the generated questions across a diverse, balanced mix of the 14 distinct question formats. Do not rely heavily on any single format; strive for a balanced distribution of these types throughout the generated questions (where supported by the notes).
 
 You must distribute the generated questions across a diverse mix of the 14 formats listed above. The formats should NOT be restricted by the selected difficulty level; rather, all 14 formats are fully active and must be used across all difficulties (easy, moderate, hard). The selected difficulty level '{difficulty}' only determines the conceptual complexity and depth of the question content, as defined in the difficulty guide.
+"""
+
+    subject_norm = (subject or '').strip().lower()
+    is_math_subject = subject_norm in _MATH_SUBJECTS
+    is_accounts_subject = subject_norm in _ACCOUNTS_SUBJECTS
+    numeric_theory_section = ''
+    if is_math_subject or is_accounts_subject:
+        subject_label = 'Mathematics' if is_math_subject else 'Accountancy'
+        numeric_theory_lines = []
+        for idx in range(1, count + 1):
+            # Deterministic repeating 3:2 pattern -> 60% numerical-sum, 40% theory,
+            # assigned per-index (same hard-instruction mechanism as the 14 question
+            # formats above) instead of a soft "split roughly X%" suggestion.
+            slot = (idx - 1) % 5
+            if slot < 3:
+                numeric_theory_lines.append(
+                    f"Question {idx} (index {idx-1} in the JSON 'questions' array) MUST be a pure "
+                    f"numerical/problem-solving question - the candidate must calculate a value, solve "
+                    f"an equation, or work out a result (a \"sum\" style question)."
+                )
+            else:
+                numeric_theory_lines.append(
+                    f"Question {idx} (index {idx-1} in the JSON 'questions' array) MUST be a theory/"
+                    f"conceptual question - a definition, property, formula recall, or concept "
+                    f"identification with NO calculation required - and all four options MUST be "
+                    f"EXACTLY ONE WORD each (a single term - not two words, not a short phrase, "
+                    f"not a sentence)."
+                )
+        numeric_theory_block = "\n".join(numeric_theory_lines)
+        numeric_theory_section = f"""
+IMPORTANT - {subject_label.upper()} NUMERICAL/THEORY ASSIGNMENT FOR EACH QUESTION:
+These notes are from a {subject_label} subject. You must generate exactly {count} questions, where
+each question in the output JSON array must strictly follow the numerical-vs-theory assignment
+below for its index - this OVERRIDES the general format assignment above wherever the two would
+conflict (e.g. a "theory" index must not become Match the Following or a long statement format;
+keep it a short, direct format such as MCQ, fill-in-the-blank, or name-the-following):
+{numeric_theory_block}
+
+This split is intentionally fixed at roughly 60% numerical / 40% theory across the whole set and
+must be followed exactly index-by-index, not just approximated overall.
 """
 
     prompt = f'''You are a veteran question-setter for Indian government exams: TNPSC (Group 1/2/4), UPSC (Prelims/Mains), and TNTET. You are creating a practice quiz from study notes, matching real exam patterns exactly for the requested difficulty band.
@@ -386,6 +474,7 @@ You must generate exactly {count} questions, where each question in the output J
 
 {format_section}
 Only use these formats where they genuinely fit the fact being tested and the notes support it - do not force an assertion-reason or statement format onto a fact that is naturally a simple direct-answer question. Most questions should still be plain direct-answer MCQs.
+{numeric_theory_section}
 
 IMPORTANT - LENGTH AND READABILITY (applies at EVERY difficulty level, especially moderate and hard):
 The candidate gets a strict 18 SECONDS on screen to read the question stem, read all four options, and pick an answer, before the screen moves on. These questions are also frequently copied out as plain text and read on a phone screen with no app formatting around them at all - so the raw wording itself, not just how an app displays it, has to be short and simple enough to take in at a glance. Every question must be fully readable and answerable within that 18-second window, on a small screen, with zero re-reading. A moderate or hard question is NEVER made harder by being longer or more elaborately worded - it is made harder by WHAT it asks (connecting two facts, spotting the one incorrect statement, applying a concept), while staying just as quick to read as an easy question. Long, essay-like question stems and long, full-sentence options are a defect, not a sign of difficulty - fix them, do not write them.
@@ -414,8 +503,7 @@ Rules:
 11. Before finalizing each question, solve it yourself from scratch as if you were a student, using only the question and options - do not just write something plausible-sounding. Double-check any arithmetic, ordering, or logic in your head, and make sure the option you mark as correct is the option that is ACTUALLY correct, not merely the one your first instinct picked. If you are generating a worked example inside an explanation (e.g. listing sample arrangements or numbers), verify that example itself is valid and satisfies every constraint the question stated (such as "no repeated digits") before including it.
 12. When a question or option contains a multi-digit number, group its digits using ONE consistent, correct convention throughout - either the Indian system (groups of 2 digits after the first 3 from the right, e.g. 12,34,567) or the international system (groups of 3 digits, e.g. 1,234,567) - matching whichever system the notes themselves use. Never mix the two styles within the same number, never insert stray digits or extra comma groups, and double-check that the grouped number still reads back as the exact same value intended.
 13. Every "explanation" must reach a complete, specific conclusion - never trail off with vague phrases like "...and so on", "...continues in this way", or similar hand-waving. State the final value, place, or term explicitly, every time.
-14. If the notes are from a Mathematics subject, split the question set roughly 80% numerical/problem-solving questions (the candidate must calculate a value, solve an equation, or work out a result - e.g. "sum" style questions) and 20% theory/conceptual questions (definitions, properties, formula recall, or concept identification with no calculation required). Base this split only on the actual content of the notes provided - if the notes are not Mathematics, ignore this rule entirely and generate questions normally.
-15. If the notes are from a Accounts subject, split the question set roughly 80% numerical/problem-solving questions (the candidate must calculate a value, solve an equation, or work out a result - e.g. "sum" style questions) and 20% theory/conceptual questions (definitions, properties, formula recall, or concept identification with no calculation required). Base this split only on the actual content of the notes provided - if the notes are not Accounts, ignore this rule entirely and generate questions normally.
+14. If a MATHEMATICS/ACCOUNTANCY NUMERICAL/THEORY ASSIGNMENT section appears above, it is a hard, per-question-index requirement, not a suggestion - follow it exactly for every question. If no such section appears above, ignore this rule entirely and generate questions normally.
 
 STUDY NOTES:
 {notes_text}
@@ -840,7 +928,9 @@ async def _call_gemini_limited(semaphore: asyncio.Semaphore, prompt: str, api_ke
 
 _INITIAL_OVERASK_FACTOR = 1.2
 
-async def generate_questions_data(notes_text: str, count: int, difficulty: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, language: str=None) -> dict:
+async def generate_questions_data(notes_text: str, count: int, difficulty: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, language: str=None, subject: str=None, format_state: dict=None) -> dict:
+    if format_state is None:
+        format_state = new_format_state(subject)
     initial_ask = max(count, round(count * _INITIAL_OVERASK_FACTOR))
     chunk_size = 15
     chunk_threshold = chunk_size + 2
@@ -851,16 +941,12 @@ async def generate_questions_data(notes_text: str, count: int, difficulty: str, 
     seen: list[dict] = []
     sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENCY)
     prompts = []
-    current_fmt_idx = 0
     for idx, size in enumerate(chunk_sizes):
-        formats_list = []
-        for _ in range(size):
-            formats_list.append((current_fmt_idx % 14) + 1)
-            current_fmt_idx += 1
+        formats_list = _assign_question_formats(size, format_state)
         diversity_hint = ""
         if len(chunk_sizes) > 1:
             diversity_hint = f"\n\nADDITIONAL CONTEXT FOR DIVERSITY:\nThis is request {idx + 1} of {len(chunk_sizes)} concurrent generation requests for these notes.\nTo avoid duplicates, focus on a different part or aspect of the notes (e.g., section {idx + 1} of the content) and write unique questions.\n"
-        prompt_str = build_prompt(notes_text, size, difficulty, language, formats_list) + diversity_hint
+        prompt_str = build_prompt(notes_text, size, difficulty, language, formats_list, subject=subject) + diversity_hint
         prompts.append(prompt_str)
     tasks = [_call_gemini_limited(sem, p, api_key, model) for p in prompts]
     raw_replies = await asyncio.gather(*tasks)
@@ -869,11 +955,9 @@ async def generate_questions_data(notes_text: str, count: int, difficulty: str, 
     while len(merged_questions) < count and backfill_attempts < 5:
         shortfall = count - len(merged_questions)
         ask_for = min(25, max(shortfall, round(shortfall * 2.0)))
-        backfill_formats = []
-        for i in range(ask_for):
-            backfill_formats.append(((len(merged_questions) + i) % 14) + 1)
+        backfill_formats = _assign_question_formats(ask_for, format_state)
         avoid_list = [q['question'] for q in merged_questions[-60:]]
-        backfill_prompt = build_prompt(notes_text, ask_for, difficulty, language, backfill_formats, avoid_questions=avoid_list)
+        backfill_prompt = build_prompt(notes_text, ask_for, difficulty, language, backfill_formats, avoid_questions=avoid_list, subject=subject)
         try:
             backfill_reply = await asyncio.to_thread(call_gemini, backfill_prompt, api_key, model)
             _merge_chunk_replies([backfill_reply], seen, merged_questions, language)
@@ -1014,7 +1098,9 @@ def _merge_window_results(window_results: list, seen: list, all_questions: list)
             seen.append(candidate)
             all_questions.append(q)
 
-async def _run_backfill(count: int, all_questions: list, seen: list, windows: list, difficulty: str, overall_language: str, api_key: str, selected_model: str) -> None:
+async def _run_backfill(count: int, all_questions: list, seen: list, windows: list, difficulty: str, overall_language: str, api_key: str, selected_model: str, subject: str=None, format_state: dict=None) -> None:
+    if format_state is None:
+        format_state = new_format_state(subject)
     backfill_attempts = 0
     while len(all_questions) < count and backfill_attempts < 12:
         shortfall = count - len(all_questions)
@@ -1022,10 +1108,8 @@ async def _run_backfill(count: int, all_questions: list, seen: list, windows: li
         window_idx = backfill_attempts % len(windows)
         target_window_text = windows[window_idx]
         avoid_list = [q['question'] for q in all_questions[-60:]]
-        backfill_formats = []
-        for i in range(ask_for):
-            backfill_formats.append(((len(all_questions) + i) % 14) + 1)
-        backfill_prompt = build_prompt(target_window_text, ask_for, difficulty, overall_language, backfill_formats, avoid_questions=avoid_list)
+        backfill_formats = _assign_question_formats(ask_for, format_state)
+        backfill_prompt = build_prompt(target_window_text, ask_for, difficulty, overall_language, backfill_formats, avoid_questions=avoid_list, subject=subject)
         try:
             raw_reply = await asyncio.to_thread(call_gemini, backfill_prompt, api_key, selected_model)
             chunk_data = _parse_json_reply(raw_reply)
@@ -1134,10 +1218,11 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         overall_language = _detect_generation_language(subject, board, full_notes_text)
 
         _job_set(job_id, status='generating', delivered_count=0, requested_count=count)
+        format_state = new_format_state(subject)
         tasks = []
         for window_text, window_count in zip(windows, window_counts):
             if window_count <= 0: continue
-            tasks.append(generate_questions_data(window_text, window_count, difficulty, api_key, selected_model, language=overall_language))
+            tasks.append(generate_questions_data(window_text, window_count, difficulty, api_key, selected_model, language=overall_language, subject=subject, format_state=format_state))
         try:
             window_results = await asyncio.gather(*tasks)
         except errors.ClientError as e:
@@ -1151,7 +1236,7 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         seen: list[dict] = []
         _merge_window_results(window_results, seen, all_questions)
         _job_set(job_id, delivered_count=len(all_questions))
-        await _run_backfill(count, all_questions, seen, windows, difficulty, overall_language, api_key, selected_model)
+        await _run_backfill(count, all_questions, seen, windows, difficulty, overall_language, api_key, selected_model, subject=subject, format_state=format_state)
         _job_set(job_id, status='verifying', delivered_count=len(all_questions))
         all_questions = await verify_and_correct_answers(all_questions, api_key, selected_model, overall_language)
         _job_set(job_id, status='proofreading')

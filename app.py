@@ -679,7 +679,7 @@ Respond with ONLY valid JSON, no extra commentary, no markdown fences, in exactl
 }}'''
     return prompt
 
-def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thinking_budget: int=0, _is_retry: bool=False, _rate_limit_attempt: int=0, _tried_key_values: frozenset | None=None):
+def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thinking_budget: int=0, _is_retry: bool=False, _rate_limit_attempt: int=0, _server_error_attempt: int=0, _tried_key_values: frozenset | None=None):
     from google.genai import errors, types
 
     tried_key_values = _tried_key_values or frozenset()
@@ -697,7 +697,7 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
                 'Add a fresh key or wait for quota to reset before generating more questions.'
             )
         active_key = replacement
-        _is_retry, _rate_limit_attempt = False, 0
+        _is_retry, _rate_limit_attempt, _server_error_attempt = False, 0, 0
 
     tried_key_values = tried_key_values | {active_key}
     client = genai.Client(api_key=active_key)
@@ -708,11 +708,12 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
             config = types.GenerateContentConfig(response_mime_type='application/json')
         response = client.models.generate_content(model=model, contents=prompt, config=config)
         return response.text
-    except errors.ClientError as e:
-        is_unavailable = getattr(e, 'code', None) == 404 and 'no longer available' in str(e).lower()
-        if is_unavailable and (not _is_retry) and (model != _FALLBACK_GEMINI_MODEL):
+    except errors.APIError as e:
+        is_unavailable_model = getattr(e, 'code', None) == 404 and 'no longer available' in str(e).lower()
+        if is_unavailable_model and (not _is_retry) and (model != _FALLBACK_GEMINI_MODEL):
             print(f"[call_gemini] Model '{model}' is unavailable on this API key ({e}); retrying once with fallback '{_FALLBACK_GEMINI_MODEL}'.")
             return call_gemini(prompt, active_key, model=_FALLBACK_GEMINI_MODEL, thinking_budget=thinking_budget, _is_retry=True, _tried_key_values=tried_key_values)
+
         is_rate_limited = getattr(e, 'code', None) == 429 or 'resource_exhausted' in str(e).lower() or 'quota' in str(e).lower()
         if is_rate_limited and _rate_limit_attempt < _MAX_RATE_LIMIT_RETRIES:
             # Short retries on the SAME key first - handles transient
@@ -721,7 +722,7 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
             wait_seconds = int(match.group(1)) + 3 if match else _RATE_LIMIT_BACKOFF_SECONDS * (_rate_limit_attempt + 1)
             print(f"[call_gemini] Rate-limited by Gemini on key '{active_key[-4:]}' ({e}); retrying in {wait_seconds}s (attempt {_rate_limit_attempt + 1}/{_MAX_RATE_LIMIT_RETRIES}).")
             time.sleep(wait_seconds)
-            return call_gemini(prompt, active_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt + 1, _tried_key_values=tried_key_values)
+            return call_gemini(prompt, active_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt + 1, _server_error_attempt=_server_error_attempt, _tried_key_values=tried_key_values)
         if is_rate_limited:
             # This key's short-retry budget is used up - treat it as
             # exhausted (daily quota depleted, not just a momentary rate
@@ -730,11 +731,36 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
             next_key = GEMINI_KEY_POOL.next_untried_key(tried_key_values)
             if next_key is not None:
                 print('[call_gemini] Failing over to the next configured Gemini API key.')
-                return call_gemini(prompt, next_key, model=model, thinking_budget=thinking_budget, _is_retry=False, _rate_limit_attempt=0, _tried_key_values=tried_key_values)
+                return call_gemini(prompt, next_key, model=model, thinking_budget=thinking_budget, _is_retry=False, _rate_limit_attempt=0, _server_error_attempt=0, _tried_key_values=tried_key_values)
             raise GeminiAllKeysExhaustedError(
                 'All configured Gemini API keys (paid + backup) are exhausted or rate-limited. '
                 'Add a fresh key or wait for quota to reset before generating more questions.'
             ) from e
+
+        # Google-side outage/overload (503 UNAVAILABLE, occasionally a bare
+        # 500) - not a quota problem at all, so this can hit ANY key, paid or
+        # free. Same short-retry-then-failover shape as the rate-limit case
+        # above, just on its own counter so it doesn't share/skew the
+        # rate-limit retry budget.
+        code = getattr(e, 'code', None)
+        status = str(getattr(e, 'status', '') or '').upper()
+        is_server_overloaded = code in (503, 500) or status in ('UNAVAILABLE', 'INTERNAL') or 'unavailable' in str(e).lower() or 'high demand' in str(e).lower()
+        if is_server_overloaded and _server_error_attempt < _MAX_RATE_LIMIT_RETRIES:
+            wait_seconds = _RATE_LIMIT_BACKOFF_SECONDS * (_server_error_attempt + 1)
+            print(f"[call_gemini] Gemini reporting high demand/{code or status} on key '{active_key[-4:]}' ({e}); retrying in {wait_seconds}s (attempt {_server_error_attempt + 1}/{_MAX_RATE_LIMIT_RETRIES}).")
+            time.sleep(wait_seconds)
+            return call_gemini(prompt, active_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt, _server_error_attempt=_server_error_attempt + 1, _tried_key_values=tried_key_values)
+        if is_server_overloaded:
+            # Still overloaded after the same-key retries - as a last resort
+            # try a different configured key (won't usually help since the
+            # model itself is overloaded, not the key, but it's cheap to try
+            # and occasionally different keys land on different backends).
+            # This key is NOT marked exhausted - it's not a quota issue.
+            next_key = GEMINI_KEY_POOL.next_untried_key(tried_key_values)
+            if next_key is not None:
+                print('[call_gemini] Still high-demand after retries; trying a different configured key as a last resort.')
+                return call_gemini(prompt, next_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt, _server_error_attempt=0, _tried_key_values=tried_key_values)
+            print('[call_gemini] Gemini still reporting high demand after retrying every configured key; giving up on this call.')
         raise
 
 _PROOFREAD_CHUNK_SIZE = 25
@@ -1422,6 +1448,13 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         except errors.ClientError as e:
             if getattr(e, 'code', None) == 404 and 'no longer available' in str(e).lower():
                 _job_set(job_id, status='error', error=f"Model '{selected_model}' (and the fallback model) are not available on this Gemini API key. Try a different model from GET /models.")
+            else:
+                _job_set(job_id, status='error', error=f'Gemini API error: {e}')
+            return
+        except errors.APIError as e:
+            code = getattr(e, 'code', None)
+            if code in (503, 500) or 'unavailable' in str(e).lower() or 'high demand' in str(e).lower():
+                _job_set(job_id, status='error', error=f"Gemini is currently experiencing high demand and stayed unavailable after several retries ({e}). Please try again shortly.")
             else:
                 _job_set(job_id, status='error', error=f'Gemini API error: {e}')
             return

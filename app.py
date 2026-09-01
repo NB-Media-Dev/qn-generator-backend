@@ -115,6 +115,43 @@ _notes_text_cache_lock = threading.Lock()
 CHUNK_THRESHOLD = 30
 CHUNK_SIZE = 25
 GEMINI_MAX_CONCURRENCY = int(os.getenv('GEMINI_MAX_CONCURRENCY', '5'))
+# In-memory job store for the async generate-questions job pattern.
+# Render/Vercel (and most PaaS reverse proxies) kill an HTTP request that
+# takes too long (often well under a minute) - a 200-question job with
+# generate -> verify -> proofread stages can easily take several minutes.
+# So /generate-questions now returns a job_id almost immediately, and the
+# actual work runs in an asyncio background task. The frontend polls
+# GET /generate-questions/status/{job_id} until status is 'done' or 'error'.
+# NOTE: this in-memory dict is per-process. On Render this is fine as long
+# as the service runs a single instance/worker (the default for a small
+# FastAPI app). If you ever scale to multiple instances/workers, move this
+# to the database (e.g. a GenerationJob table) instead - a job started on
+# worker A won't be visible when polled on worker B.
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+_JOB_TTL_SECONDS = 60 * 60  # drop finished job records after 1 hour
+GEMINI_CALL_TIMEOUT_SECONDS = int(os.getenv('GEMINI_CALL_TIMEOUT_SECONDS', '90'))
+
+
+def _job_set(job_id: str, **fields) -> None:
+    with _jobs_lock:
+        job = _jobs.setdefault(job_id, {})
+        job.update(fields)
+        job['updated_at'] = time.time()
+
+
+def _job_get(job_id: str) -> dict | None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return dict(job) if job else None
+
+
+def _jobs_cleanup() -> None:
+    now = time.time()
+    with _jobs_lock:
+        stale = [jid for jid, j in _jobs.items() if j.get('status') in ('done', 'error') and now - j.get('updated_at', now) > _JOB_TTL_SECONDS]
+        for jid in stale:
+            _jobs.pop(jid, None)
 _MAX_RATE_LIMIT_RETRIES = 5
 _RATE_LIMIT_BACKOFF_SECONDS = 5
 _RETRY_DELAY_RE = re.compile('retryDelay[\'\\"]?\\s*:\\s*[\'\\"]?(\\d+)')
@@ -377,8 +414,8 @@ Rules:
 11. Before finalizing each question, solve it yourself from scratch as if you were a student, using only the question and options - do not just write something plausible-sounding. Double-check any arithmetic, ordering, or logic in your head, and make sure the option you mark as correct is the option that is ACTUALLY correct, not merely the one your first instinct picked. If you are generating a worked example inside an explanation (e.g. listing sample arrangements or numbers), verify that example itself is valid and satisfies every constraint the question stated (such as "no repeated digits") before including it.
 12. When a question or option contains a multi-digit number, group its digits using ONE consistent, correct convention throughout - either the Indian system (groups of 2 digits after the first 3 from the right, e.g. 12,34,567) or the international system (groups of 3 digits, e.g. 1,234,567) - matching whichever system the notes themselves use. Never mix the two styles within the same number, never insert stray digits or extra comma groups, and double-check that the grouped number still reads back as the exact same value intended.
 13. Every "explanation" must reach a complete, specific conclusion - never trail off with vague phrases like "...and so on", "...continues in this way", or similar hand-waving. State the final value, place, or term explicitly, every time.
-14. If the notes are from a Mathematics subject, split the question set roughly 60% numerical/problem-solving questions (the candidate must calculate a value, solve an equation, or work out a result - e.g. "sum" style questions) and 40% theory/conceptual questions (definitions, properties, formula recall, or concept identification with no calculation required). Base this split only on the actual content of the notes provided - if the notes are not Mathematics, ignore this rule entirely and generate questions normally.
-15. If the notes are from a Accounts subject, split the question set roughly 60% numerical/problem-solving questions (the candidate must calculate a value, solve an equation, or work out a result - e.g. "sum" style questions) and 40% theory/conceptual questions (definitions, properties, formula recall, or concept identification with no calculation required). Base this split only on the actual content of the notes provided - if the notes are not Accounts, ignore this rule entirely and generate questions normally.
+14. If the notes are from a Mathematics subject, split the question set roughly 80% numerical/problem-solving questions (the candidate must calculate a value, solve an equation, or work out a result - e.g. "sum" style questions) and 20% theory/conceptual questions (definitions, properties, formula recall, or concept identification with no calculation required). Base this split only on the actual content of the notes provided - if the notes are not Mathematics, ignore this rule entirely and generate questions normally.
+15. If the notes are from a Accounts subject, split the question set roughly 80% numerical/problem-solving questions (the candidate must calculate a value, solve an equation, or work out a result - e.g. "sum" style questions) and 20% theory/conceptual questions (definitions, properties, formula recall, or concept identification with no calculation required). Base this split only on the actual content of the notes provided - if the notes are not Accounts, ignore this rule entirely and generate questions normally.
 
 STUDY NOTES:
 {notes_text}
@@ -459,7 +496,11 @@ def _proofread_batch(batch: list[dict], api_key: str, model: str, language: str)
 
 async def _proofread_batch_limited(semaphore: asyncio.Semaphore, batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     async with semaphore:
-        return await asyncio.to_thread(_proofread_batch, batch, api_key, model, language)
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_proofread_batch, batch, api_key, model, language), timeout=GEMINI_CALL_TIMEOUT_SECONDS + 30)
+        except asyncio.TimeoutError:
+            print('[proofread] Batch timed out - keeping the unproofread originals for this batch.')
+            return batch
 
 async def proofread_questions(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     if not questions: return questions
@@ -566,7 +607,11 @@ def _verify_batch(batch: list[dict], api_key: str, model: str, language: str) ->
 
 async def _verify_batch_limited(semaphore: asyncio.Semaphore, batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     async with semaphore:
-        return await asyncio.to_thread(_verify_batch, batch, api_key, model, language)
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_verify_batch, batch, api_key, model, language), timeout=GEMINI_CALL_TIMEOUT_SECONDS + 30)
+        except asyncio.TimeoutError:
+            print('[verify] Batch timed out - keeping the unverified originals for this batch.')
+            return batch
 
 async def verify_and_correct_answers(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     if not questions: return questions
@@ -783,7 +828,15 @@ def _merge_chunk_replies(raw_replies: list[str], seen: list, merged_questions: l
 
 async def _call_gemini_limited(semaphore: asyncio.Semaphore, prompt: str, api_key: str, model: str):
     async with semaphore:
-        return await asyncio.to_thread(call_gemini, prompt, api_key, model)
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(call_gemini, prompt, api_key, model), timeout=GEMINI_CALL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            # A single stuck/slow Gemini call must not hang the whole batch
+            # forever - surface it as an empty reply so the caller's
+            # existing malformed-JSON handling (and backfill pass) kicks in
+            # instead of the request never returning.
+            print(f'[call_gemini] Timed out after {GEMINI_CALL_TIMEOUT_SECONDS}s, returning empty reply so the batch can continue.')
+            return '{"questions": []}'
 
 _INITIAL_OVERASK_FACTOR = 1.2
 
@@ -1058,8 +1111,86 @@ def _save_generated_questions(questions: list[dict], rows: list[dict], difficult
     finally:
         db.close()
 
-@app.post('/generate-questions', responses={400: {'description': 'Invalid difficulty, count, or model.'}, 500: {'description': 'GEMINI_API_KEY is not configured on the server.'}, 502: {'description': 'Gemini API error.'}})
+async def _run_generation_job(job_id: str, content: bytes, filename: str, count: int, difficulty: str, subject: str, board: str, standard: str, dy_code: str, ques_id_prefix: str, group_name: str | None, selected_model: str) -> None:
+    """Does the actual work that used to live inside the HTTP request/response
+    cycle of /generate-questions. Runs as a background asyncio task so a slow
+    Gemini pipeline (which easily runs past the 15-60s request timeout most
+    PaaS reverse proxies enforce - see GEMINI_CALL_TIMEOUT_SECONDS comment
+    above) never causes the client's HTTP request itself to time out."""
+    try:
+        ocr_lang = _expected_ocr_lang(subject, board)
+        print(f"[ocr] job={job_id} subject={subject!r} board={board!r} -> ocr_lang={ocr_lang!r}")
+        _job_set(job_id, status='extracting')
+        full_notes_text = await get_notes_text(content, filename, ocr_lang)
+        if not full_notes_text.strip():
+            _job_set(job_id, status='error', error='No text could be extracted from this file')
+            return
+        windows = split_text_into_windows(full_notes_text, count)
+        window_counts = split_count_across_windows(count, len(windows))
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            _job_set(job_id, status='error', error='GEMINI_API_KEY is not set on the server.')
+            return
+        overall_language = _detect_generation_language(subject, board, full_notes_text)
+
+        _job_set(job_id, status='generating', delivered_count=0, requested_count=count)
+        tasks = []
+        for window_text, window_count in zip(windows, window_counts):
+            if window_count <= 0: continue
+            tasks.append(generate_questions_data(window_text, window_count, difficulty, api_key, selected_model, language=overall_language))
+        try:
+            window_results = await asyncio.gather(*tasks)
+        except errors.ClientError as e:
+            if getattr(e, 'code', None) == 404 and 'no longer available' in str(e).lower():
+                _job_set(job_id, status='error', error=f"Model '{selected_model}' (and the fallback model) are not available on this Gemini API key. Try a different model from GET /models.")
+            else:
+                _job_set(job_id, status='error', error=f'Gemini API error: {e}')
+            return
+
+        all_questions: list[dict] = []
+        seen: list[dict] = []
+        _merge_window_results(window_results, seen, all_questions)
+        _job_set(job_id, delivered_count=len(all_questions))
+        await _run_backfill(count, all_questions, seen, windows, difficulty, overall_language, api_key, selected_model)
+        _job_set(job_id, status='verifying', delivered_count=len(all_questions))
+        all_questions = await verify_and_correct_answers(all_questions, api_key, selected_model, overall_language)
+        _job_set(job_id, status='proofreading')
+        all_questions = await proofread_questions(all_questions, api_key, selected_model, overall_language)
+
+        data = {'questions': all_questions, 'requested_count': count, 'delivered_count': len(all_questions)}
+        data = fix_answer_consistency(data)
+        batch_id = str(uuid.uuid4())
+        kept_questions, skipped_existing = _split_out_db_duplicates(data['questions'], filename)
+        rows = _build_dy_rows(kept_questions, subject, standard, dy_code, ques_id_prefix)
+        _job_set(job_id, status='saving')
+        _save_generated_questions(kept_questions, rows, difficulty, filename, batch_id, selected_model, board, standard, subject, group_name)
+
+        shortfall_note = None
+        if data['delivered_count'] < data['requested_count']:
+            shortfall_note = f'Only {data["delivered_count"]} of {data["requested_count"]} requested questions could be generated without repeating the same underlying fact.'
+        duplicate_note = None
+        if skipped_existing:
+            duplicate_note = f'{skipped_existing} question(s) already existed in the database for this file and difficulty, so they were not saved again.'
+
+        result = {'questions': data['questions'], 'count': data['delivered_count'], 'requested_count': data['requested_count'], 'difficulty': difficulty, 'batch_id': batch_id, 'model': selected_model, 'note': shortfall_note, 'duplicate_note': duplicate_note, 'board': board, 'standard': standard, 'subject': subject, 'group_name': group_name, 'dy_code': dy_code}
+        _job_set(job_id, status='done', result=result, delivered_count=data['delivered_count'])
+    except Exception as e:
+        # Catch-all so a bug or an unexpected Gemini/network error surfaces
+        # as a clean 'error' status on the job instead of the background
+        # task dying silently and the frontend polling forever.
+        print(f'[generate-questions job={job_id}] failed: {e}')
+        _job_set(job_id, status='error', error=f'Unexpected error: {e}')
+
+
+@app.post('/generate-questions', responses={400: {'description': 'Invalid difficulty, count, or model.'}, 500: {'description': 'GEMINI_API_KEY is not configured on the server.'}})
 async def generate_questions_endpoint(file: Annotated[UploadFile, File()], count: Annotated[int, Form()], difficulty: Annotated[str, Form()], subject: Annotated[str, Form()], board: Annotated[str, Form()], standard: Annotated[str, Form()], dy_code: Annotated[str, Form()], ques_id_prefix: Annotated[str, Form()], group_name: Annotated[str | None, Form()]=None, model: Annotated[str | None, Form()]=None):
+    """Validates the request, kicks off generation as a background job, and
+    returns a job_id right away. Poll GET /generate-questions/status/{job_id}
+    for progress and the final result. (Previously this endpoint ran the
+    whole generate -> verify -> proofread pipeline inline and returned the
+    questions directly - that blocked the HTTP request for minutes on large
+    counts, which Render/Vercel's own request timeout would kill well before
+    completion. This is the fix for that.)"""
     difficulty = difficulty.lower().strip()
     if difficulty not in ('easy', 'moderate', 'hard'): raise HTTPException(status_code=400, detail='difficulty must be easy, moderate, or hard')
     if count < 1 or count > 500: raise HTTPException(status_code=400, detail='count must be between 1 and 500')
@@ -1074,42 +1205,28 @@ async def generate_questions_endpoint(file: Annotated[UploadFile, File()], count
     if not subject or not board or (not standard): raise HTTPException(status_code=400, detail='board, standard and subject are required')
     if not dy_code: raise HTTPException(status_code=400, detail='dy_code is required')
     if not ques_id_prefix: raise HTTPException(status_code=400, detail='ques_id_prefix is required')
+    if not os.getenv('GEMINI_API_KEY'): raise HTTPException(status_code=500, detail='GEMINI_API_KEY is not set on the server.')
+
     content = await file.read()
-    ocr_lang = _expected_ocr_lang(subject, board)
-    print(f"[ocr] subject={subject!r} board={board!r} -> ocr_lang={ocr_lang!r}")
-    full_notes_text = await get_notes_text(content, file.filename, ocr_lang)
-    if not full_notes_text.strip(): raise HTTPException(status_code=400, detail='No text could be extracted from this file')
-    windows = split_text_into_windows(full_notes_text, count)
-    window_counts = split_count_across_windows(count, len(windows))
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key: raise HTTPException(status_code=500, detail='GEMINI_API_KEY is not set on the server.')
-    overall_language = _detect_generation_language(subject, board, full_notes_text)
-    tasks = []
-    for window_text, window_count in zip(windows, window_counts):
-        if window_count <= 0: continue
-        tasks.append(generate_questions_data(window_text, window_count, difficulty, api_key, selected_model, language=overall_language))
-    try:
-        window_results = await asyncio.gather(*tasks)
-    except errors.ClientError as e:
-        if getattr(e, 'code', None) == 404 and 'no longer available' in str(e).lower(): raise HTTPException(status_code=502, detail=f"Model '{selected_model}' (and the fallback model) are not available on this Gemini API key. Try a different model from GET /models.")
-        raise HTTPException(status_code=502, detail=f'Gemini API error: {e}')
-    all_questions: list[dict] = []
-    seen: list[dict] = []
-    _merge_window_results(window_results, seen, all_questions)
-    await _run_backfill(count, all_questions, seen, windows, difficulty, overall_language, api_key, selected_model)
-    all_questions = await verify_and_correct_answers(all_questions, api_key, selected_model, overall_language)
-    all_questions = await proofread_questions(all_questions, api_key, selected_model, overall_language)
-    data = {'questions': all_questions, 'requested_count': count, 'delivered_count': len(all_questions)}
-    data = fix_answer_consistency(data)
-    batch_id = str(uuid.uuid4())
-    kept_questions, skipped_existing = _split_out_db_duplicates(data['questions'], file.filename)
-    rows = _build_dy_rows(kept_questions, subject, standard, dy_code, ques_id_prefix)
-    _save_generated_questions(kept_questions, rows, difficulty, file.filename, batch_id, selected_model, board, standard, subject, group_name)
-    shortfall_note = None
-    if data['delivered_count'] < data['requested_count']: shortfall_note = f'Only {data["delivered_count"]} of {data["requested_count"]} requested questions could be generated without repeating the same underlying fact.'
-    duplicate_note = None
-    if skipped_existing: duplicate_note = f'{skipped_existing} question(s) already existed in the database for this file and difficulty, so they were not saved again.'
-    return {'questions': data['questions'], 'count': data['delivered_count'], 'requested_count': data['requested_count'], 'difficulty': difficulty, 'batch_id': batch_id, 'model': selected_model, 'note': shortfall_note, 'duplicate_note': duplicate_note, 'board': board, 'standard': standard, 'subject': subject, 'group_name': group_name, 'dy_code': dy_code}
+    filename = file.filename
+    _jobs_cleanup()
+    job_id = str(uuid.uuid4())
+    _job_set(job_id, status='queued', delivered_count=0, requested_count=count, result=None, error=None)
+    asyncio.create_task(_run_generation_job(job_id, content, filename, count, difficulty, subject, board, standard, dy_code, ques_id_prefix, group_name, selected_model))
+    return {'job_id': job_id, 'status': 'queued'}
+
+
+@app.get('/generate-questions/status/{job_id}')
+async def generate_questions_status(job_id: str):
+    job = _job_get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail='Unknown or expired job_id')
+    response = {'job_id': job_id, 'status': job.get('status'), 'delivered_count': job.get('delivered_count', 0), 'requested_count': job.get('requested_count')}
+    if job.get('status') == 'done':
+        response.update(job.get('result') or {})
+    elif job.get('status') == 'error':
+        response['detail'] = job.get('error')
+    return response
 
 @app.get('/models')
 def list_models():

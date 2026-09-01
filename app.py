@@ -163,6 +163,96 @@ if DEFAULT_GEMINI_MODEL not in ALLOWED_GEMINI_MODELS:
     print(f'[startup] GEMINI_MODEL={DEFAULT_GEMINI_MODEL!r} is not in ALLOWED_GEMINI_MODELS; falling back to {_FALLBACK_GEMINI_MODEL!r}.')
     DEFAULT_GEMINI_MODEL = _FALLBACK_GEMINI_MODEL
 
+# --- Gemini API key pool (1 paid key + up to 3 free backup keys) ----------
+# GEMINI_API_KEY is the paid key (kept as the original env var name so existing
+# deployments keep working unchanged). GEMINI_API_KEY_2 / _3 / _4 are optional
+# free backup keys. Live generation should only fail once every configured key
+# has been tried and is exhausted/rate-limited - not the instant the paid key
+# runs out. When we do fall back onto a free key, the frontend is told via the
+# job's `key_notice` field so the user knows the paid key is depleted and the
+# batch was produced with a backup free key instead.
+class GeminiAllKeysExhaustedError(RuntimeError):
+    pass
+
+class _GeminiKeyPool:
+    def __init__(self, keys: list[dict]):
+        self._keys = keys                 # [{'key': str, 'label': str, 'is_paid': bool}, ...]
+        self._lock = threading.Lock()
+        self._exhausted: set[int] = set()
+
+    def has_any_key(self) -> bool:
+        return len(self._keys) > 0
+
+    def is_marked_exhausted(self, key_value: str) -> bool:
+        with self._lock:
+            for i, k in enumerate(self._keys):
+                if k['key'] == key_value:
+                    return i in self._exhausted
+            return False
+
+    def mark_exhausted(self, key_value: str, reason: str = '') -> None:
+        with self._lock:
+            for i, k in enumerate(self._keys):
+                if k['key'] == key_value:
+                    if i not in self._exhausted:
+                        self._exhausted.add(i)
+                        print(f"[gemini-keys] '{k['label']}' key marked exhausted/rate-limited{(': ' + reason) if reason else ''}.")
+                    return
+
+    def reset(self) -> None:
+        """Clear exhausted markers (e.g. quotas typically reset ~daily). Not
+        called automatically - available for an admin/cron hook if needed."""
+        with self._lock:
+            self._exhausted.clear()
+
+    def starting_key(self) -> str | None:
+        """Best key to start a fresh top-level call with: the first
+        non-exhausted key in priority order (paid first, then backups)."""
+        with self._lock:
+            for i, k in enumerate(self._keys):
+                if i not in self._exhausted:
+                    return k['key']
+            return None
+
+    def next_untried_key(self, tried_values: set) -> str | None:
+        with self._lock:
+            for i, k in enumerate(self._keys):
+                if i in self._exhausted:
+                    continue
+                if k['key'] in tried_values:
+                    continue
+                return k['key']
+            return None
+
+    def all_exhausted(self) -> bool:
+        with self._lock:
+            return len(self._keys) > 0 and len(self._exhausted) >= len(self._keys)
+
+    def paid_key_exhausted(self) -> bool:
+        with self._lock:
+            for i, k in enumerate(self._keys):
+                if k['is_paid']:
+                    return i in self._exhausted
+            return False
+
+    def any_backup_key_configured(self) -> bool:
+        return any(not k['is_paid'] for k in self._keys)
+
+
+def _load_gemini_api_keys() -> list[dict]:
+    keys = []
+    paid = (os.getenv('GEMINI_API_KEY') or '').strip()
+    if paid:
+        keys.append({'key': paid, 'label': 'paid', 'is_paid': True})
+    for i in (2, 3, 4):
+        backup = (os.getenv(f'GEMINI_API_KEY_{i}') or '').strip()
+        if backup and backup not in {k['key'] for k in keys}:
+            keys.append({'key': backup, 'label': f'backup_{i - 1}', 'is_paid': False})
+    return keys
+
+
+GEMINI_KEY_POOL = _GeminiKeyPool(_load_gemini_api_keys())
+
 _COMBINING_MARKS = '\u0B82\u0BBE-\u0BCD\u0BD7\u0900-\u0903\u093A-\u094F\u0951-\u0957\u0962-\u0963'
 _DUPLICATED_MARK_RE = re.compile(f'([{_COMBINING_MARKS}])\\1+')
 _TAMIL_CHAR_RE = re.compile('[\\u0B80-\\u0BFF]')
@@ -526,9 +616,28 @@ Respond with ONLY valid JSON, no extra commentary, no markdown fences, in exactl
 }}'''
     return prompt
 
-def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thinking_budget: int=0, _is_retry: bool=False, _rate_limit_attempt: int=0):
+def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thinking_budget: int=0, _is_retry: bool=False, _rate_limit_attempt: int=0, _tried_key_values: frozenset | None=None):
     from google.genai import errors, types
-    client = genai.Client(api_key=api_key)
+
+    tried_key_values = _tried_key_values or frozenset()
+
+    # If the key we were handed is already known to be exhausted (some other
+    # concurrent call already burned through its retries), skip straight to
+    # the next available key in the pool instead of wasting another request
+    # on a key we already know is dead.
+    active_key = api_key
+    if GEMINI_KEY_POOL.is_marked_exhausted(active_key):
+        replacement = GEMINI_KEY_POOL.next_untried_key(tried_key_values)
+        if replacement is None:
+            raise GeminiAllKeysExhaustedError(
+                'All configured Gemini API keys (paid + backup) are exhausted or rate-limited. '
+                'Add a fresh key or wait for quota to reset before generating more questions.'
+            )
+        active_key = replacement
+        _is_retry, _rate_limit_attempt = False, 0
+
+    tried_key_values = tried_key_values | {active_key}
+    client = genai.Client(api_key=active_key)
     try:
         if thinking_budget > 0:
             config = types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget), response_mime_type='application/json')
@@ -540,14 +649,29 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
         is_unavailable = getattr(e, 'code', None) == 404 and 'no longer available' in str(e).lower()
         if is_unavailable and (not _is_retry) and (model != _FALLBACK_GEMINI_MODEL):
             print(f"[call_gemini] Model '{model}' is unavailable on this API key ({e}); retrying once with fallback '{_FALLBACK_GEMINI_MODEL}'.")
-            return call_gemini(prompt, api_key, model=_FALLBACK_GEMINI_MODEL, thinking_budget=thinking_budget, _is_retry=True)
-        is_rate_limited = getattr(e, 'code', None) == 429 or 'resource_exhausted' in str(e).lower()
+            return call_gemini(prompt, active_key, model=_FALLBACK_GEMINI_MODEL, thinking_budget=thinking_budget, _is_retry=True, _tried_key_values=tried_key_values)
+        is_rate_limited = getattr(e, 'code', None) == 429 or 'resource_exhausted' in str(e).lower() or 'quota' in str(e).lower()
         if is_rate_limited and _rate_limit_attempt < _MAX_RATE_LIMIT_RETRIES:
+            # Short retries on the SAME key first - handles transient
+            # per-minute rate limits without burning through the whole pool.
             match = _RETRY_DELAY_RE.search(str(e))
             wait_seconds = int(match.group(1)) + 3 if match else _RATE_LIMIT_BACKOFF_SECONDS * (_rate_limit_attempt + 1)
-            print(f'[call_gemini] Rate-limited by Gemini ({e}); retrying in {wait_seconds}s (attempt {_rate_limit_attempt + 1}/{_MAX_RATE_LIMIT_RETRIES}).')
+            print(f"[call_gemini] Rate-limited by Gemini on key '{active_key[-4:]}' ({e}); retrying in {wait_seconds}s (attempt {_rate_limit_attempt + 1}/{_MAX_RATE_LIMIT_RETRIES}).")
             time.sleep(wait_seconds)
-            return call_gemini(prompt, api_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt + 1)
+            return call_gemini(prompt, active_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt + 1, _tried_key_values=tried_key_values)
+        if is_rate_limited:
+            # This key's short-retry budget is used up - treat it as
+            # exhausted (daily quota depleted, not just a momentary rate
+            # limit) and fail over to the next configured key in the pool.
+            GEMINI_KEY_POOL.mark_exhausted(active_key, reason=str(e)[:200])
+            next_key = GEMINI_KEY_POOL.next_untried_key(tried_key_values)
+            if next_key is not None:
+                print('[call_gemini] Failing over to the next configured Gemini API key.')
+                return call_gemini(prompt, next_key, model=model, thinking_budget=thinking_budget, _is_retry=False, _rate_limit_attempt=0, _tried_key_values=tried_key_values)
+            raise GeminiAllKeysExhaustedError(
+                'All configured Gemini API keys (paid + backup) are exhausted or rate-limited. '
+                'Add a fresh key or wait for quota to reset before generating more questions.'
+            ) from e
         raise
 
 _PROOFREAD_CHUNK_SIZE = 25
@@ -1211,9 +1335,12 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
             return
         windows = split_text_into_windows(full_notes_text, count)
         window_counts = split_count_across_windows(count, len(windows))
-        api_key = os.getenv('GEMINI_API_KEY')
+        api_key = GEMINI_KEY_POOL.starting_key()
         if not api_key:
-            _job_set(job_id, status='error', error='GEMINI_API_KEY is not set on the server.')
+            if GEMINI_KEY_POOL.has_any_key():
+                _job_set(job_id, status='error', error='All configured Gemini API keys (paid + backup) are currently exhausted or rate-limited. Add a fresh key or wait for quota to reset.')
+            else:
+                _job_set(job_id, status='error', error='GEMINI_API_KEY is not set on the server.')
             return
         overall_language = _detect_generation_language(subject, board, full_notes_text)
 
@@ -1230,6 +1357,9 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
                 _job_set(job_id, status='error', error=f"Model '{selected_model}' (and the fallback model) are not available on this Gemini API key. Try a different model from GET /models.")
             else:
                 _job_set(job_id, status='error', error=f'Gemini API error: {e}')
+            return
+        except GeminiAllKeysExhaustedError as e:
+            _job_set(job_id, status='error', error=str(e))
             return
 
         all_questions: list[dict] = []
@@ -1257,8 +1387,16 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         if skipped_existing:
             duplicate_note = f'{skipped_existing} question(s) already existed in the database for this file and difficulty, so they were not saved again.'
 
-        result = {'questions': data['questions'], 'count': data['delivered_count'], 'requested_count': data['requested_count'], 'difficulty': difficulty, 'batch_id': batch_id, 'model': selected_model, 'note': shortfall_note, 'duplicate_note': duplicate_note, 'board': board, 'standard': standard, 'subject': subject, 'group_name': group_name, 'dy_code': dy_code}
+        key_notice = None
+        if GEMINI_KEY_POOL.paid_key_exhausted() and GEMINI_KEY_POOL.any_backup_key_configured():
+            key_notice = 'Your paid Gemini key has been exhausted - this batch (and any further generations, until it resets) was produced using a backup free key instead.'
+        result = {'questions': data['questions'], 'count': data['delivered_count'], 'requested_count': data['requested_count'], 'difficulty': difficulty, 'batch_id': batch_id, 'model': selected_model, 'note': shortfall_note, 'duplicate_note': duplicate_note, 'key_notice': key_notice, 'board': board, 'standard': standard, 'subject': subject, 'group_name': group_name, 'dy_code': dy_code}
         _job_set(job_id, status='done', result=result, delivered_count=data['delivered_count'])
+    except GeminiAllKeysExhaustedError as e:
+        # All paid + backup keys are exhausted/rate-limited - this is the
+        # only case where generation should actually fail on quota grounds.
+        print(f'[generate-questions job={job_id}] all Gemini keys exhausted: {e}')
+        _job_set(job_id, status='error', error=str(e))
     except Exception as e:
         # Catch-all so a bug or an unexpected Gemini/network error surfaces
         # as a clean 'error' status on the job instead of the background
@@ -1290,7 +1428,8 @@ async def generate_questions_endpoint(file: Annotated[UploadFile, File()], count
     if not subject or not board or (not standard): raise HTTPException(status_code=400, detail='board, standard and subject are required')
     if not dy_code: raise HTTPException(status_code=400, detail='dy_code is required')
     if not ques_id_prefix: raise HTTPException(status_code=400, detail='ques_id_prefix is required')
-    if not os.getenv('GEMINI_API_KEY'): raise HTTPException(status_code=500, detail='GEMINI_API_KEY is not set on the server.')
+    if not GEMINI_KEY_POOL.has_any_key(): raise HTTPException(status_code=500, detail='GEMINI_API_KEY is not set on the server.')
+    if GEMINI_KEY_POOL.all_exhausted(): raise HTTPException(status_code=503, detail='All configured Gemini API keys (paid + backup) are currently exhausted or rate-limited. Add a fresh key or wait for quota to reset.')
 
     content = await file.read()
     filename = file.filename
@@ -1316,6 +1455,23 @@ async def generate_questions_status(job_id: str):
 @app.get('/models')
 def list_models():
     return {'default': DEFAULT_GEMINI_MODEL, 'models': [{'id': model_id, 'label': label} for model_id, label in ALLOWED_GEMINI_MODELS.items()]}
+
+@app.get('/gemini-key-status')
+def gemini_key_status():
+    """Lightweight visibility into the Gemini key pool - which key generation
+    is currently running on, and whether the paid key has been exhausted, so
+    this can be checked/monitored without digging through server logs."""
+    return {
+        'configured_keys': len(GEMINI_KEY_POOL._keys),
+        'paid_key_configured': any(k['is_paid'] for k in GEMINI_KEY_POOL._keys),
+        'paid_key_exhausted': GEMINI_KEY_POOL.paid_key_exhausted(),
+        'backup_keys_configured': sum(1 for k in GEMINI_KEY_POOL._keys if not k['is_paid']),
+        'all_keys_exhausted': GEMINI_KEY_POOL.all_exhausted(),
+        'currently_generating_with': (
+            'none available - all keys exhausted' if GEMINI_KEY_POOL.all_exhausted()
+            else next((k['label'] for k in GEMINI_KEY_POOL._keys if not GEMINI_KEY_POOL.is_marked_exhausted(k['key'])), 'unknown')
+        ),
+    }
 
 @app.post('/questions/select', responses={400: {'description': 'batch_id is required'}})
 def save_selection(payload: SelectionPayload):

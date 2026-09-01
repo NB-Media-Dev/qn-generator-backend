@@ -174,11 +174,14 @@ if DEFAULT_GEMINI_MODEL not in ALLOWED_GEMINI_MODELS:
 class GeminiAllKeysExhaustedError(RuntimeError):
     pass
 
+_KEY_PROBE_COOLDOWN_SECONDS = int(os.getenv('GEMINI_KEY_PROBE_COOLDOWN_SECONDS', '600'))  # 10 minutes
+
 class _GeminiKeyPool:
     def __init__(self, keys: list[dict]):
         self._keys = keys                 # [{'key': str, 'label': str, 'is_paid': bool}, ...]
         self._lock = threading.Lock()
         self._exhausted: set[int] = set()
+        self._last_probe_at: dict[int, float] = {}
 
     def has_any_key(self) -> bool:
         return len(self._keys) > 0
@@ -196,14 +199,9 @@ class _GeminiKeyPool:
                 if k['key'] == key_value:
                     if i not in self._exhausted:
                         self._exhausted.add(i)
+                        self._last_probe_at[i] = time.time()  # cooldown starts counting from now
                         print(f"[gemini-keys] '{k['label']}' key marked exhausted/rate-limited{(': ' + reason) if reason else ''}.")
                     return
-
-    def reset(self) -> None:
-        """Clear exhausted markers (e.g. quotas typically reset ~daily). Not
-        called automatically - available for an admin/cron hook if needed."""
-        with self._lock:
-            self._exhausted.clear()
 
     def starting_key(self) -> str | None:
         """Best key to start a fresh top-level call with: the first
@@ -237,6 +235,71 @@ class _GeminiKeyPool:
 
     def any_backup_key_configured(self) -> bool:
         return any(not k['is_paid'] for k in self._keys)
+
+    # --- Auto-recovery: periodically re-test exhausted keys -------------
+    def _keys_due_for_probe(self) -> list[int]:
+        now = time.time()
+        with self._lock:
+            return [i for i in self._exhausted if now - self._last_probe_at.get(i, 0) >= _KEY_PROBE_COOLDOWN_SECONDS]
+
+    def _record_probe_result(self, index: int, recovered: bool) -> None:
+        with self._lock:
+            self._last_probe_at[index] = time.time()
+            if recovered and index in self._exhausted:
+                self._exhausted.discard(index)
+                print(f"[gemini-keys] '{self._keys[index]['label']}' key passed its recheck - back in rotation.")
+
+    def probe_exhausted_keys(self) -> None:
+        """Cheap, low-token test call on any exhausted key whose cooldown has
+        elapsed. Lets a recharged paid key (or a key whose daily quota reset)
+        get picked back up automatically, without waiting for a server
+        restart. Cost stays low because: (1) this only runs when at least one
+        key is currently exhausted, (2) each key is only re-tested once per
+        _KEY_PROBE_COOLDOWN_SECONDS, and (3) the test call itself is a tiny
+        few-token prompt, not a real generation request."""
+        from google.genai import types
+        due = self._keys_due_for_probe()
+        for i in due:
+            key_value = self._keys[i]['key']
+            label = self._keys[i]['label']
+            try:
+                client = genai.Client(api_key=key_value)
+                client.models.generate_content(
+                    model=_FALLBACK_GEMINI_MODEL,
+                    contents='Reply with the single word OK.',
+                    config=types.GenerateContentConfig(max_output_tokens=5),
+                )
+                self._record_probe_result(i, recovered=True)
+            except Exception as e:
+                print(f"[gemini-keys] Recheck on '{label}' still failing: {str(e)[:150]}")
+                self._record_probe_result(i, recovered=False)
+
+    def full_reset(self) -> None:
+        """Manual override for the 'Use paid key again' button - clears every
+        exhausted flag immediately instead of waiting on the cooldown, for
+        when the user knows they just topped up the paid key."""
+        with self._lock:
+            self._exhausted.clear()
+            self._last_probe_at.clear()
+
+    def status_snapshot(self) -> dict:
+        with self._lock:
+            now = time.time()
+            keys_info = []
+            for i, k in enumerate(self._keys):
+                exhausted = i in self._exhausted
+                next_probe_in = None
+                if exhausted:
+                    last = self._last_probe_at.get(i, 0)
+                    next_probe_in = max(0, int(_KEY_PROBE_COOLDOWN_SECONDS - (now - last)))
+                keys_info.append({'label': k['label'], 'is_paid': k['is_paid'], 'exhausted': exhausted, 'next_recheck_in_seconds': next_probe_in})
+            active = next((k['label'] for k in keys_info if not k['exhausted']), None)
+            return {
+                'configured_keys': len(self._keys),
+                'active_key': active,
+                'all_exhausted': len(self._keys) > 0 and len(self._exhausted) >= len(self._keys),
+                'keys': keys_info,
+            }
 
 
 def _load_gemini_api_keys() -> list[dict]:
@@ -1335,6 +1398,10 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
             return
         windows = split_text_into_windows(full_notes_text, count)
         window_counts = split_count_across_windows(count, len(windows))
+        # Give a previously-exhausted key (paid, most importantly) a cheap
+        # recheck if its cooldown has elapsed - picks a recharged paid key
+        # back up automatically without needing a server restart.
+        await asyncio.to_thread(GEMINI_KEY_POOL.probe_exhausted_keys)
         api_key = GEMINI_KEY_POOL.starting_key()
         if not api_key:
             if GEMINI_KEY_POOL.has_any_key():
@@ -1429,6 +1496,7 @@ async def generate_questions_endpoint(file: Annotated[UploadFile, File()], count
     if not dy_code: raise HTTPException(status_code=400, detail='dy_code is required')
     if not ques_id_prefix: raise HTTPException(status_code=400, detail='ques_id_prefix is required')
     if not GEMINI_KEY_POOL.has_any_key(): raise HTTPException(status_code=500, detail='GEMINI_API_KEY is not set on the server.')
+    await asyncio.to_thread(GEMINI_KEY_POOL.probe_exhausted_keys)
     if GEMINI_KEY_POOL.all_exhausted(): raise HTTPException(status_code=503, detail='All configured Gemini API keys (paid + backup) are currently exhausted or rate-limited. Add a fresh key or wait for quota to reset.')
 
     content = await file.read()
@@ -1459,19 +1527,17 @@ def list_models():
 @app.get('/gemini-key-status')
 def gemini_key_status():
     """Lightweight visibility into the Gemini key pool - which key generation
-    is currently running on, and whether the paid key has been exhausted, so
-    this can be checked/monitored without digging through server logs."""
-    return {
-        'configured_keys': len(GEMINI_KEY_POOL._keys),
-        'paid_key_configured': any(k['is_paid'] for k in GEMINI_KEY_POOL._keys),
-        'paid_key_exhausted': GEMINI_KEY_POOL.paid_key_exhausted(),
-        'backup_keys_configured': sum(1 for k in GEMINI_KEY_POOL._keys if not k['is_paid']),
-        'all_keys_exhausted': GEMINI_KEY_POOL.all_exhausted(),
-        'currently_generating_with': (
-            'none available - all keys exhausted' if GEMINI_KEY_POOL.all_exhausted()
-            else next((k['label'] for k in GEMINI_KEY_POOL._keys if not GEMINI_KEY_POOL.is_marked_exhausted(k['key'])), 'unknown')
-        ),
-    }
+    is currently running on, whether the paid key has been exhausted, and
+    when each exhausted key will next be automatically rechecked."""
+    return GEMINI_KEY_POOL.status_snapshot()
+
+@app.post('/gemini-key-status/reset')
+def gemini_key_status_reset():
+    """Manual override for a 'Use paid key again' button - clears every
+    exhausted flag immediately (skips the automatic recheck cooldown), for
+    when the user knows they just topped up the paid key."""
+    GEMINI_KEY_POOL.full_reset()
+    return {'status': 'reset', 'message': 'All Gemini API keys will be tried again, starting with the paid key.', **GEMINI_KEY_POOL.status_snapshot()}
 
 @app.post('/questions/select', responses={400: {'description': 'batch_id is required'}})
 def save_selection(payload: SelectionPayload):

@@ -765,61 +765,20 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
 
 _PROOFREAD_CHUNK_SIZE = 25
 
-def _build_proofread_prompt(questions: list[dict]) -> str:
-    payload = [{'question': q.get('question', ''), 'options': q.get('options', {}), 'answer': q.get('answer', ''), 'explanation': q.get('explanation', '')} for q in questions]
-    return f'You are a strict proofreader for a language quiz. Below is a JSON array\ncontaining multiple-choice questions.\n\nIMPORTANT - MATHEMATICAL FORMATTING (fix if broken, do not introduce): Never wrap\nvariables or expressions in dollar signs ($x$, $$x$$) or LaTeX backslash commands\n(\\alpha, \\times, \\cdot). Use plain Unicode symbols instead: operators + - \u00d7 / = < > \u2264 \u2265\n\u221a ^, Greek letters \u03b1 \u03b2 \u03b3 \u03b8 \u03bb \u03bc \u03c0 \u03c6 \u03c3 \u03c9 \u03b4 \u03b5 \u03b7 \u03c8 \u03c4 \u03c7 \u03be \u03b6 (never spelled out as words like\n"alpha" or "pi"), and vertical bars for absolute value (|x|). Never spell out\noperations in words ("divided by", "minus", "equals", "absolute value of") - use\nthe symbol. If a question already contains $ signs, LaTeX commands, or\nspelled-out operators/Greek letters, silently correct them to clean symbol form\nas part of your fix.\n\nCarefully re-read every single word in every question, option, and\nexplanation. Fix ONLY genuine spelling/typo mistakes, such as:\n- an extra duplicated letter, syllable, or diacritic (e.g. a repeated\n  vowel sign or virama/pulli mark) stuck onto or before a word\n- a MISSING or DROPPED letter\n- a stray extra character, word fragment, or lone consonant sitting\n  between words\n- a multi-digit number whose comma grouping is broken, inconsistent, or\n  mixes the Indian and international grouping styles - fix the grouping\n  so it correctly represents the same numeric value, never change the\n  value itself\n- the literal word "dash" or its transliteration appearing where a\n  fill-in-the-blank underscore line should be - replace it with ______\n- any other obvious typo\n\nDo NOT change facts, meaning, wording style, which option is marked\ncorrect, or the overall structure. Do NOT translate anything. Do NOT add,\nremove, or reorder questions - return exactly the same number of items in\nthe same order.\n\nReturn ONLY the corrected JSON, no commentary, no markdown fences, in\nexactly this structure:\n\n{{"questions": [{{"question": "...", "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}}, "answer": "A", "explanation": "..."}}]}}\n\nJSON TO PROOFREAD:\n{json.dumps(payload, ensure_ascii=False)}\n'
-
-def _proofread_batch(batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
-    try:
-        raw_reply = call_gemini(_build_proofread_prompt(batch), api_key, model)
-        parsed = _parse_json_reply(raw_reply)
-        fixed_list = parsed.get('questions') if isinstance(parsed, dict) else parsed
-        if not isinstance(fixed_list, list) or len(fixed_list) != len(batch): return batch
-    except Exception:
-        return batch
-    result = []
-    for original, fixed in zip(batch, fixed_list):
-        if not isinstance(fixed, dict) or not _is_valid_question(fixed):
-            result.append(original)
-            continue
-        if fixed.get('answer') != original.get('answer'):
-            result.append(original)
-            continue
-        candidate = dict(original)
-        candidate['question'] = clean_math_formatting(clean_extraction_artifacts(fixed.get('question', original.get('question', ''))))
-        candidate['options'] = {letter: clean_math_formatting(clean_extraction_artifacts(fixed.get('options', {}).get(letter, original.get('options', {}).get(letter, '')))) for letter in ('A', 'B', 'C', 'D')}
-        candidate['explanation'] = clean_math_formatting(clean_extraction_artifacts(fixed.get('explanation', original.get('explanation', ''))))
-        if _question_has_script_corruption(candidate, language):
-            result.append(original)
-        else:
-            result.append(candidate)
-    return result
-
-async def _proofread_batch_limited(semaphore: asyncio.Semaphore, batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
-    async with semaphore:
-        try:
-            return await asyncio.wait_for(asyncio.to_thread(_proofread_batch, batch, api_key, model, language), timeout=GEMINI_CALL_TIMEOUT_SECONDS + 30)
-        except asyncio.TimeoutError:
-            print('[proofread] Batch timed out - keeping the unproofread originals for this batch.')
-            return batch
-
-async def proofread_questions(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
-    if not questions: return questions
-    batch_size = 15
-    sem = asyncio.Semaphore(5)
-    tasks = []
-    for i in range(0, len(questions), batch_size):
-        batch = questions[i:i + batch_size]
-        tasks.append(_proofread_batch_limited(sem, batch, api_key, model, language))
-    batches = await asyncio.gather(*tasks)
-    proofed = []
-    for b in batches:
-        proofed.extend(b)
-    return proofed
-
 _VERIFY_CHUNK_SIZE = 20
 
-def _build_verification_prompt(questions: list[dict], language: str) -> str:
+# NOTE: verify (answer-key audit) and proofread (typo sweep) used to be two
+# separate Gemini passes over the same batch - two full network round-trips
+# per batch, run one after the other. They're merged into a single prompt/
+# pass below (_build_verify_and_proofread_prompt / verify_and_proofread_questions)
+# to cut that in half. Both original instruction sets are kept IN FULL and
+# run as two explicit, separately-numbered steps inside the one prompt
+# (audit/rewrite first, then a dedicated meticulous typo sweep on the
+# audited result) rather than merged into vaguer combined wording - so the
+# model isn't given a reason to skim either job. Nothing from either
+# original checklist was dropped.
+
+def _build_verify_and_proofread_prompt(questions: list[dict], language: str) -> str:
     payload = [{'question': q.get('question', ''), 'options': q.get('options', {}), 'answer': q.get('answer', ''), 'explanation': q.get('explanation', '')} for q in questions]
     if language == 'Tamil':
         pattern_rules = '''
@@ -850,8 +809,9 @@ IMPORTANT ENFORCEMENT RULES FOR ENGLISH EXAM PATTERNS:
      "Both A and R are true, but R is not the correct explanation of A"
 3. Clean any spelling errors and formatting issues.
 '''
-    return f'''You are a meticulous exam answer-key auditor working in {language}. Below is a JSON array of multiple-choice questions.
+    return f'''You are a meticulous exam answer-key auditor AND proofreader working in {language}. Below is a JSON array of multiple-choice questions. Do BOTH steps below, in order, for every question - do not skip or rush either step.
 
+===== STEP 1: ANSWER-KEY AUDIT =====
 For EACH question, independently:
 1. Solve it yourself from scratch using only the question and its four options.
 2. Verify the correct answer option and check if the explanation is accurate, clear, and teaches the fact directly. The question, every option, and the explanation must NEVER refer to "the notes/passage/text/document/source/chapter/lesson/page/above" or any equivalent phrase in any language (e.g. Tamil "இந்த பக்கத்தில்", "குறிப்புகளின்படி") - if you find such a phrase, rewrite that field as a standalone fact/question with the reference removed entirely.
@@ -867,7 +827,27 @@ For EACH question, independently:
 
 {pattern_rules}
 
-Return ONLY valid JSON, in exactly this structure:
+===== STEP 2: METICULOUS PROOFREAD (apply to the STEP 1 output, not the original) =====
+Now, separately from Step 1, carefully re-read every single word of every question, option,
+and explanation you just produced in Step 1. Fix ONLY genuine spelling/typo mistakes, such as:
+- an extra duplicated letter, syllable, or diacritic (e.g. a repeated vowel sign or
+  virama/pulli mark) stuck onto or before a word
+- a MISSING or DROPPED letter
+- a stray extra character, word fragment, or lone consonant sitting between words
+- a multi-digit number whose comma grouping is broken, inconsistent, or mixes the
+  Indian and international grouping styles - fix the grouping so it correctly represents
+  the same numeric value, never change the value itself
+- the literal word "dash" or its transliteration appearing where a fill-in-the-blank
+  underscore line should be - replace it with ______
+- any other obvious typo
+Do NOT undo or second-guess your own Step 1 rewrite, change facts/meaning/wording style/
+which option is correct, or translate anything, while doing this pass.
+
+Do NOT add, remove, or reorder questions - return exactly the same number of items in the
+same order as the input below.
+
+Return ONLY valid JSON (the final result after BOTH steps), no commentary, no markdown
+fences, in exactly this structure:
 {{
   "questions": [
     {{
@@ -879,12 +859,12 @@ Return ONLY valid JSON, in exactly this structure:
   ]
 }}
 
-QUESTIONS TO AUDIT:
+QUESTIONS TO AUDIT AND PROOFREAD:
 {json.dumps(payload, ensure_ascii=False)}'''
 
-def _verify_batch(batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
+def _verify_and_proofread_batch(batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     try:
-        raw_reply = call_gemini(_build_verification_prompt(batch, language), api_key, model)
+        raw_reply = call_gemini(_build_verify_and_proofread_prompt(batch, language), api_key, model)
         parsed = _parse_json_reply(raw_reply)
         fixed_list = parsed.get('questions') if isinstance(parsed, dict) else parsed
         if not isinstance(fixed_list, list) or len(fixed_list) != len(batch): return batch
@@ -906,27 +886,30 @@ def _verify_batch(batch: list[dict], api_key: str, model: str, language: str) ->
             result.append(candidate)
     return result
 
-async def _verify_batch_limited(semaphore: asyncio.Semaphore, batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
+async def _verify_and_proofread_batch_limited(semaphore: asyncio.Semaphore, batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     async with semaphore:
         try:
-            return await asyncio.wait_for(asyncio.to_thread(_verify_batch, batch, api_key, model, language), timeout=GEMINI_CALL_TIMEOUT_SECONDS + 30)
+            # A merged pass does more work per call than either half used to,
+            # so it gets extra headroom on top of the usual per-call timeout
+            # rather than reusing the plain verify/proofread timeout as-is.
+            return await asyncio.wait_for(asyncio.to_thread(_verify_and_proofread_batch, batch, api_key, model, language), timeout=GEMINI_CALL_TIMEOUT_SECONDS + 45)
         except asyncio.TimeoutError:
-            print('[verify] Batch timed out - keeping the unverified originals for this batch.')
+            print('[verify+proofread] Batch timed out - keeping the un-audited originals for this batch.')
             return batch
 
-async def verify_and_correct_answers(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
+async def verify_and_proofread_questions(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     if not questions: return questions
     batch_size = 15
     sem = asyncio.Semaphore(5)
     tasks = []
     for i in range(0, len(questions), batch_size):
         batch = questions[i:i + batch_size]
-        tasks.append(_verify_batch_limited(sem, batch, api_key, model, language))
+        tasks.append(_verify_and_proofread_batch_limited(sem, batch, api_key, model, language))
     batches = await asyncio.gather(*tasks)
-    verified = []
+    result = []
     for b in batches:
-        verified.extend(b)
-    return verified
+        result.extend(b)
+    return result
 
 async def get_notes_text(content: bytes, filename: str, ocr_lang: str='eng+tam'):
     file_hash = hashlib.sha256(content).hexdigest()
@@ -1468,9 +1451,7 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         _job_set(job_id, delivered_count=len(all_questions))
         await _run_backfill(count, all_questions, seen, windows, difficulty, overall_language, api_key, selected_model, subject=subject, format_state=format_state)
         _job_set(job_id, status='verifying', delivered_count=len(all_questions))
-        all_questions = await verify_and_correct_answers(all_questions, api_key, selected_model, overall_language)
-        _job_set(job_id, status='proofreading')
-        all_questions = await proofread_questions(all_questions, api_key, selected_model, overall_language)
+        all_questions = await verify_and_proofread_questions(all_questions, api_key, selected_model, overall_language)
 
         data = {'questions': all_questions, 'requested_count': count, 'delivered_count': len(all_questions)}
         data = fix_answer_consistency(data)

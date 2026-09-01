@@ -140,6 +140,27 @@ def _job_set(job_id: str, **fields) -> None:
         job['updated_at'] = time.time()
 
 
+def _job_bump_delivered(job_id: str | None, add: int) -> None:
+    """Increments a job's delivered_count as individual chunks finish,
+    instead of only updating it in big jumps after a whole phase completes
+    (which is why the UI used to sit at '0/200' for the entire generation
+    stage even though work was actively happening). Clamped to
+    requested_count so several windows finishing over-asked chunks at once
+    can't briefly show something like '210/200'."""
+    if not job_id or add <= 0:
+        return
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        requested = job.get('requested_count')
+        new_value = job.get('delivered_count', 0) + add
+        if requested is not None:
+            new_value = min(new_value, requested)
+        job['delivered_count'] = new_value
+        job['updated_at'] = time.time()
+
+
 def _job_get(job_id: str) -> dict | None:
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -1124,7 +1145,7 @@ async def _call_gemini_limited(semaphore: asyncio.Semaphore, prompt: str, api_ke
 
 _INITIAL_OVERASK_FACTOR = 1.2
 
-async def generate_questions_data(notes_text: str, count: int, difficulty: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, language: str=None, subject: str=None, format_state: dict=None) -> dict:
+async def generate_questions_data(notes_text: str, count: int, difficulty: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, language: str=None, subject: str=None, format_state: dict=None, job_id: str | None=None) -> dict:
     if format_state is None:
         format_state = new_format_state(subject)
     initial_ask = max(count, round(count * _INITIAL_OVERASK_FACTOR))
@@ -1145,8 +1166,16 @@ async def generate_questions_data(notes_text: str, count: int, difficulty: str, 
         prompt_str = build_prompt(notes_text, size, difficulty, language, formats_list, subject=subject) + diversity_hint
         prompts.append(prompt_str)
     tasks = [_call_gemini_limited(sem, p, api_key, model) for p in prompts]
-    raw_replies = await asyncio.gather(*tasks)
-    await asyncio.to_thread(_merge_chunk_replies, raw_replies, seen, merged_questions, language)
+    # Merge each chunk's reply as soon as IT finishes (asyncio.as_completed),
+    # instead of waiting for every chunk to finish and merging all at once
+    # (asyncio.gather) - this is what lets delivered_count actually climb
+    # (10/200, 20/200, ...) while generation is still in progress, rather
+    # than sitting at 0 until the whole batch of chunks lands together.
+    for coro in asyncio.as_completed(tasks):
+        raw_reply = await coro
+        before = len(merged_questions)
+        await asyncio.to_thread(_merge_chunk_replies, [raw_reply], seen, merged_questions, language)
+        _job_bump_delivered(job_id, len(merged_questions) - before)
     backfill_attempts = 0
     while len(merged_questions) < count and backfill_attempts < 5:
         shortfall = count - len(merged_questions)
@@ -1156,7 +1185,9 @@ async def generate_questions_data(notes_text: str, count: int, difficulty: str, 
         backfill_prompt = build_prompt(notes_text, ask_for, difficulty, language, backfill_formats, avoid_questions=avoid_list, subject=subject)
         try:
             backfill_reply = await asyncio.to_thread(call_gemini, backfill_prompt, api_key, model)
+            before = len(merged_questions)
             _merge_chunk_replies([backfill_reply], seen, merged_questions, language)
+            _job_bump_delivered(job_id, len(merged_questions) - before)
         except Exception:
             pass
         backfill_attempts += 1
@@ -1294,7 +1325,7 @@ def _merge_window_results(window_results: list, seen: list, all_questions: list)
             seen.append(candidate)
             all_questions.append(q)
 
-async def _run_backfill(count: int, all_questions: list, seen: list, windows: list, difficulty: str, overall_language: str, api_key: str, selected_model: str, subject: str=None, format_state: dict=None) -> None:
+async def _run_backfill(count: int, all_questions: list, seen: list, windows: list, difficulty: str, overall_language: str, api_key: str, selected_model: str, subject: str=None, format_state: dict=None, job_id: str | None=None) -> None:
     if format_state is None:
         format_state = new_format_state(subject)
     backfill_attempts = 0
@@ -1316,12 +1347,14 @@ async def _run_backfill(count: int, all_questions: list, seen: list, windows: li
         if not isinstance(questions_list, list):
             backfill_attempts += 1
             continue
+        before = len(all_questions)
         for q in questions_list:
             if len(all_questions) >= count:
                 break
             status = _process_single_question(q, overall_language, seen)
             if status == "ok":
                 all_questions.append(q)
+        _job_bump_delivered(job_id, len(all_questions) - before)
         backfill_attempts += 1
 
 def _split_out_db_duplicates(questions: list[dict], filename: str) -> tuple[list[dict], int]:
@@ -1425,7 +1458,7 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         tasks = []
         for window_text, window_count in zip(windows, window_counts):
             if window_count <= 0: continue
-            tasks.append(generate_questions_data(window_text, window_count, difficulty, api_key, selected_model, language=overall_language, subject=subject, format_state=format_state))
+            tasks.append(generate_questions_data(window_text, window_count, difficulty, api_key, selected_model, language=overall_language, subject=subject, format_state=format_state, job_id=job_id))
         try:
             window_results = await asyncio.gather(*tasks)
         except errors.ClientError as e:
@@ -1449,7 +1482,7 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         seen: list[dict] = []
         _merge_window_results(window_results, seen, all_questions)
         _job_set(job_id, delivered_count=len(all_questions))
-        await _run_backfill(count, all_questions, seen, windows, difficulty, overall_language, api_key, selected_model, subject=subject, format_state=format_state)
+        await _run_backfill(count, all_questions, seen, windows, difficulty, overall_language, api_key, selected_model, subject=subject, format_state=format_state, job_id=job_id)
         _job_set(job_id, status='verifying', delivered_count=len(all_questions))
         all_questions = await verify_and_proofread_questions(all_questions, api_key, selected_model, overall_language)
 
@@ -1568,14 +1601,21 @@ def save_selection(payload: SelectionPayload):
     finally:
         db.close()
 
-@app.delete('/questions/batch/{batch_id}', responses={404: {'description': 'No matching batch found'}})
-def delete_batch(batch_id: str): 
+@app.delete('/questions/batch/{batch_id}')
+def delete_batch(batch_id: str):
+    # DELETE is idempotent: if this batch_id was already removed (e.g. a
+    # retried generation, a duplicate-skip, or another delete request that
+    # raced this one), the desired end state - no rows with this batch_id -
+    # is already true, so this returns success with deleted_count: 0 rather
+    # than a 404. The only caller of this endpoint (index.html's "Delete
+    # this set") can bundle several batch_ids into one grouped set and
+    # deletes them all in parallel - treating an already-gone batch_id as
+    # an error would wrongly fail the whole set deletion.
     db = SessionLocal()
     try:
         db.query(SelectedQuestion).filter(SelectedQuestion.batch_id == batch_id).delete()
         deleted_count = db.query(QuestionRecord).filter(QuestionRecord.batch_id == batch_id).delete()
         db.commit()
-        if deleted_count == 0: raise HTTPException(status_code=404, detail='No matching batch found.')
         return {'status': 'deleted', 'batch_id': batch_id, 'deleted_count': deleted_count}
     finally:
         db.close()

@@ -188,7 +188,6 @@ def get_next_order_numbers_batch(dy_code: str, count: int, db=None) -> list[int]
             db = SessionLocal()
             local_session = True
         try:
-            # Query actual max order present in DB for this dy_code
             existing_orders = db.query(QuestionRecord.dy_order).filter(QuestionRecord.dy_code == dy_code).all()
             actual_max = 0
             for (ord_val,) in existing_orders:
@@ -200,7 +199,6 @@ def get_next_order_numbers_batch(dy_code: str, count: int, db=None) -> list[int]
                 row = ExamOrderCounter(dy_code=dy_code, last_order=actual_max)
                 db.add(row)
             else:
-                # Sync counter down if questions were deleted
                 if row.last_order > actual_max:
                     row.last_order = actual_max
 

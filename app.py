@@ -10,6 +10,7 @@ import hashlib
 import threading
 import difflib
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from types import SimpleNamespace
@@ -115,10 +116,22 @@ _notes_text_cache_lock = threading.Lock()
 CHUNK_THRESHOLD = 30
 CHUNK_SIZE = 25
 GEMINI_MAX_CONCURRENCY = int(os.getenv('GEMINI_MAX_CONCURRENCY', '5'))
-GEMINI_BACKUP_MAX_CONCURRENCY = int(os.getenv('GEMINI_BACKUP_MAX_CONCURRENCY', '2'))
+GEMINI_BACKUP_CONCURRENCY = int(os.getenv('GEMINI_BACKUP_CONCURRENCY', '2'))
+# In-memory job store for the async generate-questions job pattern.
+# Render/Vercel (and most PaaS reverse proxies) kill an HTTP request that
+# takes too long (often well under a minute) - a 200-question job with
+# generate -> verify -> proofread stages can easily take several minutes.
+# So /generate-questions now returns a job_id almost immediately, and the
+# actual work runs in an asyncio background task. The frontend polls
+# GET /generate-questions/status/{job_id} until status is 'done' or 'error'.
+# NOTE: this in-memory dict is per-process. On Render this is fine as long
+# as the service runs a single instance/worker (the default for a small
+# FastAPI app). If you ever scale to multiple instances/workers, move this
+# to the database (e.g. a GenerationJob table) instead - a job started on
+# worker A won't be visible when polled on worker B.
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
-_JOB_TTL_SECONDS = 60 * 60
+_JOB_TTL_SECONDS = 60 * 60  # drop finished job records after 1 hour
 GEMINI_CALL_TIMEOUT_SECONDS = int(os.getenv('GEMINI_CALL_TIMEOUT_SECONDS', '90'))
 
 
@@ -150,6 +163,34 @@ def _job_bump_delivered(job_id: str | None, add: int) -> None:
         job['updated_at'] = time.time()
 
 
+# Tracks which job a Gemini call is happening on behalf of, WITHOUT having to
+# add a job_id parameter to every function in the call chain (call_gemini,
+# generate_questions_data, _run_backfill, verify_and_proofread_questions,
+# their *_limited wrappers, etc). asyncio.to_thread and child asyncio Tasks
+# (which is what asyncio.gather/as_completed create under the hood) both
+# copy the current context when they start, so setting this once at the top
+# of _run_generation_job makes it visible to every nested call made for that
+# job - concurrently running jobs each see their own value.
+_current_job_id: ContextVar[str | None] = ContextVar('current_job_id', default=None)
+
+
+def _record_key_usage(key_value: str) -> None:
+    """Called from call_gemini right after a call actually succeeds, so the
+    job can report back which key(s) it ended up using - e.g. if the paid
+    key ran out partway through a big batch and the rest fell back to a
+    backup key, keys_used will show both."""
+    job_id = _current_job_id.get()
+    if not job_id:
+        return
+    label = GEMINI_KEY_POOL.label_for_key(key_value)
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job.setdefault('keys_used', set()).add(label)
+        job['updated_at'] = time.time()
+
+
 def _job_get(job_id: str) -> dict | None:
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -173,14 +214,22 @@ if DEFAULT_GEMINI_MODEL not in ALLOWED_GEMINI_MODELS:
     print(f'[startup] GEMINI_MODEL={DEFAULT_GEMINI_MODEL!r} is not in ALLOWED_GEMINI_MODELS; falling back to {_FALLBACK_GEMINI_MODEL!r}.')
     DEFAULT_GEMINI_MODEL = _FALLBACK_GEMINI_MODEL
 
+# --- Gemini API key pool (1 paid key + up to 3 free backup keys) ----------
+# GEMINI_API_KEY is the paid key (kept as the original env var name so existing
+# deployments keep working unchanged). GEMINI_API_KEY_2 / _3 / _4 are optional
+# free backup keys. Live generation should only fail once every configured key
+# has been tried and is exhausted/rate-limited - not the instant the paid key
+# runs out. When we do fall back onto a free key, the frontend is told via the
+# job's `key_notice` field so the user knows the paid key is depleted and the
+# batch was produced with a backup free key instead.
 class GeminiAllKeysExhaustedError(RuntimeError):
     pass
 
-_KEY_PROBE_COOLDOWN_SECONDS = int(os.getenv('GEMINI_KEY_PROBE_COOLDOWN_SECONDS', '120'))
+_KEY_PROBE_COOLDOWN_SECONDS = int(os.getenv('GEMINI_KEY_PROBE_COOLDOWN_SECONDS', '120'))  # 2 minutes - was 10; recharging the paid key shouldn't mean a long silent wait before it's picked back up automatically
 
 class _GeminiKeyPool:
     def __init__(self, keys: list[dict]):
-        self._keys = keys
+        self._keys = keys                 # [{'key': str, 'label': str, 'is_paid': bool}, ...]
         self._lock = threading.Lock()
         self._exhausted: set[int] = set()
         self._last_probe_at: dict[int, float] = {}
@@ -201,7 +250,7 @@ class _GeminiKeyPool:
                 if k['key'] == key_value:
                     if i not in self._exhausted:
                         self._exhausted.add(i)
-                        self._last_probe_at[i] = time.time()
+                        self._last_probe_at[i] = time.time()  # cooldown starts counting from now
                         print(f"[gemini-keys] '{k['label']}' key marked exhausted/rate-limited{(': ' + reason) if reason else ''}.")
                     return
 
@@ -238,17 +287,24 @@ class _GeminiKeyPool:
     def any_backup_key_configured(self) -> bool:
         return any(not k['is_paid'] for k in self._keys)
 
+    def label_for_key(self, key_value: str) -> str:
+        """Maps an actual key string back to its human label ('paid',
+        'backup_1', ...) so callers can report which key a given generation
+        actually used, without ever surfacing the real key value."""
+        with self._lock:
+            for k in self._keys:
+                if k['key'] == key_value:
+                    return k['label']
+            return 'unknown'
+
     def is_paid_key(self, key_value: str) -> bool:
-        """Whether key_value is the configured paid key, used to decide
-        generation concurrency (see GEMINI_BACKUP_MAX_CONCURRENCY). An
-        unrecognized key_value defaults to True (full concurrency) so this
-        never throttles a call using a key outside the pool."""
         with self._lock:
             for k in self._keys:
                 if k['key'] == key_value:
                     return k['is_paid']
-            return True
+            return False
 
+    # --- Auto-recovery: periodically re-test exhausted keys -------------
     def _keys_due_for_probe(self) -> list[int]:
         now = time.time()
         with self._lock:
@@ -327,6 +383,17 @@ def _load_gemini_api_keys() -> list[dict]:
 
 
 GEMINI_KEY_POOL = _GeminiKeyPool(_load_gemini_api_keys())
+
+
+def _concurrency_for_key(key_value: str) -> int:
+    """Free-tier backup keys have a much lower requests-per-minute quota
+    than the paid key. Running the usual GEMINI_MAX_CONCURRENCY (5) parallel
+    calls against a backup key mostly produces 429s that then sit through
+    the retry/backoff logic in call_gemini - which can make a backup-key
+    batch far slower overall than fewer, cleaner parallel calls would.
+    Dropping concurrency when NOT on the paid key trades a bit of raw
+    parallelism for far fewer rate-limit retries."""
+    return GEMINI_MAX_CONCURRENCY if GEMINI_KEY_POOL.is_paid_key(key_value) else GEMINI_BACKUP_CONCURRENCY
 
 _COMBINING_MARKS = '\u0B82\u0BBE-\u0BCD\u0BD7\u0900-\u0903\u093A-\u094F\u0951-\u0957\u0962-\u0963'
 _DUPLICATED_MARK_RE = re.compile(f'([{_COMBINING_MARKS}])\\1+')
@@ -467,6 +534,13 @@ def fix_answer_consistency(data: dict):
 _MATH_SUBJECTS = {'maths', 'mathematics', 'business mathematics'}
 _ACCOUNTS_SUBJECTS = {'accountancy', 'accounts', 'commerce'}
 
+# Formats 3 (Match the Following) and 8 (Assertion and Reason) are structurally
+# different from a plain direct question - too different to fit a numeric/theory
+# split, so they're dropped entirely for Maths/Accountancy. For every other
+# subject they're kept, but capped at a small fixed count PER GENERATION SET
+# (the whole requested count - e.g. 100, 150, 200 - not per chunk) rather than
+# scaling up with the total, since a set full of Match/Assertion-Reason questions
+# reads as repetitive at high volumes.
 _MATH_ACCOUNTS_EXCLUDED_FORMATS = {3, 8}
 _FORMAT_CAP_PER_SET = {3: 6, 8: 6}
 
@@ -498,7 +572,7 @@ def _assign_question_formats(count: int, state: dict) -> list[int]:
             if fmt in caps:
                 if caps[fmt] <= 0:
                     if attempts >= len(available):
-                        break
+                        break  # every format capped/exhausted - use it anyway rather than stall
                     continue
                 caps[fmt] -= 1
             break
@@ -553,6 +627,9 @@ You must distribute the generated questions across a diverse mix of the 14 forma
         subject_label = 'Mathematics' if is_math_subject else 'Accountancy'
         numeric_theory_lines = []
         for idx in range(1, count + 1):
+            # Deterministic repeating 3:2 pattern -> 60% numerical-sum, 40% theory,
+            # assigned per-index (same hard-instruction mechanism as the 14 question
+            # formats above) instead of a soft "split roughly X%" suggestion.
             slot = (idx - 1) % 5
             if slot < 3:
                 numeric_theory_lines.append(
@@ -686,6 +763,10 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
 
     tried_key_values = _tried_key_values or frozenset()
 
+    # If the key we were handed is already known to be exhausted (some other
+    # concurrent call already burned through its retries), skip straight to
+    # the next available key in the pool instead of wasting another request
+    # on a key we already know is dead.
     active_key = api_key
     if GEMINI_KEY_POOL.is_marked_exhausted(active_key):
         replacement = GEMINI_KEY_POOL.next_untried_key(tried_key_values)
@@ -705,6 +786,7 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
         else:
             config = types.GenerateContentConfig(response_mime_type='application/json')
         response = client.models.generate_content(model=model, contents=prompt, config=config)
+        _record_key_usage(active_key)
         return response.text
     except errors.APIError as e:
         is_unavailable_model = getattr(e, 'code', None) == 404 and 'no longer available' in str(e).lower()
@@ -714,12 +796,17 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
 
         is_rate_limited = getattr(e, 'code', None) == 429 or 'resource_exhausted' in str(e).lower() or 'quota' in str(e).lower()
         if is_rate_limited and _rate_limit_attempt < _MAX_RATE_LIMIT_RETRIES:
+            # Short retries on the SAME key first - handles transient
+            # per-minute rate limits without burning through the whole pool.
             match = _RETRY_DELAY_RE.search(str(e))
             wait_seconds = int(match.group(1)) + 3 if match else _RATE_LIMIT_BACKOFF_SECONDS * (_rate_limit_attempt + 1)
             print(f"[call_gemini] Rate-limited by Gemini on key '{active_key[-4:]}' ({e}); retrying in {wait_seconds}s (attempt {_rate_limit_attempt + 1}/{_MAX_RATE_LIMIT_RETRIES}).")
             time.sleep(wait_seconds)
             return call_gemini(prompt, active_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt + 1, _server_error_attempt=_server_error_attempt, _tried_key_values=tried_key_values)
         if is_rate_limited:
+            # This key's short-retry budget is used up - treat it as
+            # exhausted (daily quota depleted, not just a momentary rate
+            # limit) and fail over to the next configured key in the pool.
             GEMINI_KEY_POOL.mark_exhausted(active_key, reason=str(e)[:200])
             next_key = GEMINI_KEY_POOL.next_untried_key(tried_key_values)
             if next_key is not None:
@@ -730,6 +817,11 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
                 'Add a fresh key or wait for quota to reset before generating more questions.'
             ) from e
 
+        # Google-side outage/overload (503 UNAVAILABLE, occasionally a bare
+        # 500) - not a quota problem at all, so this can hit ANY key, paid or
+        # free. Same short-retry-then-failover shape as the rate-limit case
+        # above, just on its own counter so it doesn't share/skew the
+        # rate-limit retry budget.
         code = getattr(e, 'code', None)
         status = str(getattr(e, 'status', '') or '').upper()
         is_server_overloaded = code in (503, 500) or status in ('UNAVAILABLE', 'INTERNAL') or 'unavailable' in str(e).lower() or 'high demand' in str(e).lower()
@@ -739,6 +831,11 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
             time.sleep(wait_seconds)
             return call_gemini(prompt, active_key, model=model, thinking_budget=thinking_budget, _is_retry=_is_retry, _rate_limit_attempt=_rate_limit_attempt, _server_error_attempt=_server_error_attempt + 1, _tried_key_values=tried_key_values)
         if is_server_overloaded:
+            # Still overloaded after the same-key retries - as a last resort
+            # try a different configured key (won't usually help since the
+            # model itself is overloaded, not the key, but it's cheap to try
+            # and occasionally different keys land on different backends).
+            # This key is NOT marked exhausted - it's not a quota issue.
             next_key = GEMINI_KEY_POOL.next_untried_key(tried_key_values)
             if next_key is not None:
                 print('[call_gemini] Still high-demand after retries; trying a different configured key as a last resort.')
@@ -746,10 +843,16 @@ def call_gemini(prompt: str, api_key: str, model: str=DEFAULT_GEMINI_MODEL, thin
             print('[call_gemini] Gemini still reporting high demand after retrying every configured key; giving up on this call.')
         raise
 
-_PROOFREAD_CHUNK_SIZE = 25
-
-_VERIFY_CHUNK_SIZE = 20
-
+# NOTE: verify (answer-key audit) and proofread (typo sweep) used to be two
+# separate Gemini passes over the same batch - two full network round-trips
+# per batch, run one after the other. They're merged into a single prompt/
+# pass below (_build_verify_and_proofread_prompt / verify_and_proofread_questions)
+# to cut that in half. Both original instruction sets are kept IN FULL and
+# run as two explicit, separately-numbered steps inside the one prompt
+# (audit/rewrite first, then a dedicated meticulous typo sweep on the
+# audited result) rather than merged into vaguer combined wording - so the
+# model isn't given a reason to skim either job. Nothing from either
+# original checklist was dropped.
 
 def _build_verify_and_proofread_prompt(questions: list[dict], language: str) -> str:
     payload = [{'question': q.get('question', ''), 'options': q.get('options', {}), 'answer': q.get('answer', ''), 'explanation': q.get('explanation', '')} for q in questions]
@@ -862,6 +965,9 @@ def _verify_and_proofread_batch(batch: list[dict], api_key: str, model: str, lan
 async def _verify_and_proofread_batch_limited(semaphore: asyncio.Semaphore, batch: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     async with semaphore:
         try:
+            # A merged pass does more work per call than either half used to,
+            # so it gets extra headroom on top of the usual per-call timeout
+            # rather than reusing the plain verify/proofread timeout as-is.
             return await asyncio.wait_for(asyncio.to_thread(_verify_and_proofread_batch, batch, api_key, model, language), timeout=GEMINI_CALL_TIMEOUT_SECONDS + 45)
         except asyncio.TimeoutError:
             print('[verify+proofread] Batch timed out - keeping the un-audited originals for this batch.')
@@ -870,8 +976,7 @@ async def _verify_and_proofread_batch_limited(semaphore: asyncio.Semaphore, batc
 async def verify_and_proofread_questions(questions: list[dict], api_key: str, model: str, language: str) -> list[dict]:
     if not questions: return questions
     batch_size = 15
-    concurrency = GEMINI_MAX_CONCURRENCY if GEMINI_KEY_POOL.is_paid_key(api_key) else GEMINI_BACKUP_MAX_CONCURRENCY
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(_concurrency_for_key(api_key))
     tasks = []
     for i in range(0, len(questions), batch_size):
         batch = questions[i:i + batch_size]
@@ -1086,6 +1191,10 @@ async def _call_gemini_limited(semaphore: asyncio.Semaphore, prompt: str, api_ke
         try:
             return await asyncio.wait_for(asyncio.to_thread(call_gemini, prompt, api_key, model), timeout=GEMINI_CALL_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
+            # A single stuck/slow Gemini call must not hang the whole batch
+            # forever - surface it as an empty reply so the caller's
+            # existing malformed-JSON handling (and backfill pass) kicks in
+            # instead of the request never returning.
             print(f'[call_gemini] Timed out after {GEMINI_CALL_TIMEOUT_SECONDS}s, returning empty reply so the batch can continue.')
             return '{"questions": []}'
 
@@ -1102,14 +1211,7 @@ async def generate_questions_data(notes_text: str, count: int, difficulty: str, 
         language = detect_dominant_language(notes_text)
     merged_questions: list[dict] = []
     seen: list[dict] = []
-    # On a backup (free-tier) key the per-minute quota is much tighter than
-    # on the paid key, so firing GEMINI_MAX_CONCURRENCY calls at once mostly
-    # just draws 429s that each pay the retry/backoff delay in call_gemini -
-    # net slower than a smaller number of calls that mostly succeed on the
-    # first try. Drop concurrency automatically when running on a backup key;
-    # stays at full concurrency on the paid key.
-    concurrency = GEMINI_MAX_CONCURRENCY if GEMINI_KEY_POOL.is_paid_key(api_key) else GEMINI_BACKUP_MAX_CONCURRENCY
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(_concurrency_for_key(api_key))
     prompts = []
     for idx, size in enumerate(chunk_sizes):
         formats_list = _assign_question_formats(size, format_state)
@@ -1119,6 +1221,11 @@ async def generate_questions_data(notes_text: str, count: int, difficulty: str, 
         prompt_str = build_prompt(notes_text, size, difficulty, language, formats_list, subject=subject) + diversity_hint
         prompts.append(prompt_str)
     tasks = [_call_gemini_limited(sem, p, api_key, model) for p in prompts]
+    # Merge each chunk's reply as soon as IT finishes (asyncio.as_completed),
+    # instead of waiting for every chunk to finish and merging all at once
+    # (asyncio.gather) - this is what lets delivered_count actually climb
+    # (10/200, 20/200, ...) while generation is still in progress, rather
+    # than sitting at 0 until the whole batch of chunks lands together.
     for coro in asyncio.as_completed(tasks):
         raw_reply = await coro
         before = len(merged_questions)
@@ -1379,6 +1486,7 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
     PaaS reverse proxies enforce - see GEMINI_CALL_TIMEOUT_SECONDS comment
     above) never causes the client's HTTP request itself to time out."""
     try:
+        _current_job_id.set(job_id)
         ocr_lang = _expected_ocr_lang(subject, board)
         print(f"[ocr] job={job_id} subject={subject!r} board={board!r} -> ocr_lang={ocr_lang!r}")
         _job_set(job_id, status='extracting')
@@ -1388,6 +1496,9 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
             return
         windows = split_text_into_windows(full_notes_text, count)
         window_counts = split_count_across_windows(count, len(windows))
+        # Give a previously-exhausted key (paid, most importantly) a cheap
+        # recheck if its cooldown has elapsed - picks a recharged paid key
+        # back up automatically without needing a server restart.
         await asyncio.to_thread(GEMINI_KEY_POOL.probe_exhausted_keys)
         api_key = GEMINI_KEY_POOL.starting_key()
         if not api_key:
@@ -1446,15 +1557,29 @@ async def _run_generation_job(job_id: str, content: bytes, filename: str, count:
         if skipped_existing:
             duplicate_note = f'{skipped_existing} question(s) already existed in the database for this file and difficulty, so they were not saved again.'
 
+        # keys_used is tracked per-call in call_gemini (see _record_key_usage)
+        # via the _current_job_id context var, so this reflects exactly what
+        # THIS batch actually used - not just whatever the pool's current
+        # exhaustion state happens to be by the time the job finishes.
+        job_snapshot = _job_get(job_id) or {}
+        keys_used = sorted(job_snapshot.get('keys_used') or [])
         key_notice = None
-        if GEMINI_KEY_POOL.paid_key_exhausted() and GEMINI_KEY_POOL.any_backup_key_configured():
-            key_notice = 'Your paid Gemini key has been exhausted - this batch (and any further generations, until it resets) was produced using a backup free key instead.'
-        result = {'questions': data['questions'], 'count': data['delivered_count'], 'requested_count': data['requested_count'], 'difficulty': difficulty, 'batch_id': batch_id, 'model': selected_model, 'note': shortfall_note, 'duplicate_note': duplicate_note, 'key_notice': key_notice, 'board': board, 'standard': standard, 'subject': subject, 'group_name': group_name, 'dy_code': dy_code}
+        if keys_used and 'paid' not in keys_used:
+            key_notice = f"This batch was generated entirely on backup key(s) ({', '.join(keys_used)}) - your paid Gemini key was exhausted at the time."
+        elif len(keys_used) > 1:
+            backups = ', '.join(k for k in keys_used if k != 'paid')
+            key_notice = f"This batch started on the paid key but fell back to backup key(s) ({backups}) partway through, once the paid key ran out."
+        result = {'questions': data['questions'], 'count': data['delivered_count'], 'requested_count': data['requested_count'], 'difficulty': difficulty, 'batch_id': batch_id, 'model': selected_model, 'note': shortfall_note, 'duplicate_note': duplicate_note, 'key_notice': key_notice, 'keys_used': keys_used, 'board': board, 'standard': standard, 'subject': subject, 'group_name': group_name, 'dy_code': dy_code}
         _job_set(job_id, status='done', result=result, delivered_count=data['delivered_count'])
     except GeminiAllKeysExhaustedError as e:
+        # All paid + backup keys are exhausted/rate-limited - this is the
+        # only case where generation should actually fail on quota grounds.
         print(f'[generate-questions job={job_id}] all Gemini keys exhausted: {e}')
         _job_set(job_id, status='error', error=str(e))
     except Exception as e:
+        # Catch-all so a bug or an unexpected Gemini/network error surfaces
+        # as a clean 'error' status on the job instead of the background
+        # task dying silently and the frontend polling forever.
         print(f'[generate-questions job={job_id}] failed: {e}')
         _job_set(job_id, status='error', error=f'Unexpected error: {e}')
 
@@ -1500,7 +1625,7 @@ async def generate_questions_status(job_id: str):
     job = _job_get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail='Unknown or expired job_id')
-    response = {'job_id': job_id, 'status': job.get('status'), 'delivered_count': job.get('delivered_count', 0), 'requested_count': job.get('requested_count')}
+    response = {'job_id': job_id, 'status': job.get('status'), 'delivered_count': job.get('delivered_count', 0), 'requested_count': job.get('requested_count'), 'keys_used': sorted(job.get('keys_used') or [])}
     if job.get('status') == 'done':
         response.update(job.get('result') or {})
     elif job.get('status') == 'error':
@@ -1543,6 +1668,14 @@ def save_selection(payload: SelectionPayload):
 
 @app.delete('/questions/batch/{batch_id}')
 def delete_batch(batch_id: str):
+    # DELETE is idempotent: if this batch_id was already removed (e.g. a
+    # retried generation, a duplicate-skip, or another delete request that
+    # raced this one), the desired end state - no rows with this batch_id -
+    # is already true, so this returns success with deleted_count: 0 rather
+    # than a 404. The only caller of this endpoint (index.html's "Delete
+    # this set") can bundle several batch_ids into one grouped set and
+    # deletes them all in parallel - treating an already-gone batch_id as
+    # an error would wrongly fail the whole set deletion.
     db = SessionLocal()
     try:
         db.query(SelectedQuestion).filter(SelectedQuestion.batch_id == batch_id).delete()
